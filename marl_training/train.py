@@ -225,6 +225,13 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = out_dir / "metrics.jsonl"
 
+    print(
+        f"Starting MAPPO training: stage={args.stage} device={device} "
+        f"num_drones={args.num_drones} iters={start_iter}..{args.iters} "
+        f"rollout_steps={args.rollout_steps} out={out_dir}",
+        flush=True,
+    )
+
     last_row: dict[str, Any] = {}
     for i in range(start_iter, int(args.iters) + 1):
         if args.anneal_lr and int(args.iters) > 1:
