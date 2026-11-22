@@ -745,35 +745,61 @@ class DroneSwarmEnv(_ParallelEnvBase):
         )
 
         min_pair_per_agent = np.full(self.num_drones, float("inf"), dtype=np.float64)
+        pair_ttc_penalty = np.zeros(self.num_drones, dtype=np.float64)
         for i in range(self.num_drones):
             for j in range(i + 1, self.num_drones):
-                d_ij = float(np.linalg.norm(positions[i] - positions[j]))
+                diff_ij = positions[j] - positions[i]
+                d_ij = float(np.linalg.norm(diff_ij))
                 if d_ij < min_pair_per_agent[i]:
                     min_pair_per_agent[i] = d_ij
                 if d_ij < min_pair_per_agent[j]:
                     min_pair_per_agent[j] = d_ij
+                if d_ij < 2.6:
+                    unit = diff_ij / max(d_ij, 1e-9)
+                    rel_vel = velocities[j] - velocities[i]
+                    closing = max(0.0, -float(np.dot(unit, rel_vel)))
+                    if closing > 0.0:
+                        pen = 1.5 * closing * ((2.6 - d_ij) / 2.6)
+                        pair_ttc_penalty[i] += pen
+                        pair_ttc_penalty[j] += pen
 
         min_static_per_agent = np.full(self.num_drones, float("inf"), dtype=np.float64)
+        obs_ttc_penalty = np.zeros(self.num_drones, dtype=np.float64)
         for o in self.obstacles:
             o_xy = np.array([o.x, o.y], dtype=np.float64)
-            clearances = (
-                np.linalg.norm(positions[:, :2] - o_xy, axis=1)
-                - float(o.radius)
-                - self.contract.radius
-            )
+            deltas_xy = positions[:, :2] - o_xy
+            dists = np.linalg.norm(deltas_xy, axis=1)
+            clearances = dists - float(o.radius) - self.contract.radius
             min_static_per_agent = np.minimum(min_static_per_agent, clearances)
+            close_mask = clearances < 1.2
+            if np.any(close_mask):
+                for idx in np.flatnonzero(close_mask):
+                    unit_xy = deltas_xy[idx] / max(float(dists[idx]), 1e-9)
+                    closing = max(0.0, -float(np.dot(unit_xy, velocities[idx, :2])))
+                    if closing > 0.0:
+                        obs_ttc_penalty[idx] += 1.5 * closing * (
+                            (1.2 - max(0.0, float(clearances[idx]))) / 1.2
+                        )
 
         min_dyn_per_agent = np.full(self.num_drones, float("inf"), dtype=np.float64)
         for dyn in self.dyn_obstacles:
             if not dyn.active:
                 continue
             d_pos = np.asarray(dyn.position, dtype=np.float64).reshape(1, 3)
-            clearances = (
-                np.linalg.norm(positions - d_pos, axis=1)
-                - float(dyn.radius)
-                - self.contract.radius
-            )
+            d_vel = np.asarray(dyn.velocity, dtype=np.float64).reshape(3)
+            deltas = positions - d_pos
+            dists = np.linalg.norm(deltas, axis=1)
+            clearances = dists - float(dyn.radius) - self.contract.radius
             min_dyn_per_agent = np.minimum(min_dyn_per_agent, clearances)
+            close_mask = clearances < 1.5
+            if np.any(close_mask):
+                for idx in np.flatnonzero(close_mask):
+                    unit = deltas[idx] / max(float(dists[idx]), 1e-9)
+                    closing = max(0.0, -float(np.dot(unit, velocities[idx] - d_vel)))
+                    if closing > 0.0:
+                        obs_ttc_penalty[idx] += 1.5 * closing * (
+                            (1.5 - max(0.0, float(clearances[idx]))) / 1.5
+                        )
 
         min_clearance_per_agent = np.minimum(min_static_per_agent, min_dyn_per_agent)
 
@@ -781,6 +807,8 @@ class DroneSwarmEnv(_ParallelEnvBase):
         goal_dists = np.zeros(self.num_drones, dtype=np.float64)
         docked_mask = np.zeros(self.num_drones, dtype=bool)
         norm_denom = max(self.contract.speed * self.dt, 1e-9)
+        soft_pair_zone = max(self.contract.pair_safe, 1.35)
+        soft_obs_zone = max(self.contract.obs_margin, 0.45)
 
         for i, agent_id in enumerate(self.possible_agents):
             dist = float(np.linalg.norm(self.goals[i] - positions[i]))
@@ -796,9 +824,11 @@ class DroneSwarmEnv(_ParallelEnvBase):
                     docked_mask[i] = True
 
             if math.isfinite(min_pair_per_agent[i]):
-                r -= 4.0 * max(0.0, self.contract.pair_safe - min_pair_per_agent[i])
+                r -= 4.0 * max(0.0, soft_pair_zone - min_pair_per_agent[i])
             if math.isfinite(min_clearance_per_agent[i]):
-                r -= 4.0 * max(0.0, self.contract.obs_margin - min_clearance_per_agent[i])
+                r -= 4.0 * max(0.0, soft_obs_zone - min_clearance_per_agent[i])
+            r -= float(pair_ttc_penalty[i])
+            r -= float(obs_ttc_penalty[i])
             if per_agent_oob[i]:
                 r -= 2.0
             r -= 0.05 * action_jerks[i]
@@ -822,13 +852,18 @@ class DroneSwarmEnv(_ParallelEnvBase):
         swarm_success = bool(self._hold_counter >= self.hold_dwell)
 
         # Terminal bonuses/penalties so finishing swarm_success early strictly beats
-        # farming the +0.6/step hold bonus (0.6 / (1 - 0.99) = 60.0 discounted max).
+        # farming the +0.6/step hold bonus (0.6 / (1 - 0.99) = 60.0 discounted max),
+        # and culprit drones receive direct credit assignment on collisions.
         if swarm_success:
             for agent_id in self.possible_agents:
                 rewards[agent_id] += 80.0
         elif swarm_collision:
-            for agent_id in self.possible_agents:
-                rewards[agent_id] -= 20.0
+            for i, agent_id in enumerate(self.possible_agents):
+                culprit = (
+                    min_pair_per_agent[i] < 2.0 * self.contract.radius
+                    or min_clearance_per_agent[i] < 0.0
+                )
+                rewards[agent_id] -= 25.0 if culprit else 2.0
 
         synchronized_terminated = bool(swarm_collision or swarm_oob or swarm_success)
         synchronized_truncated = bool(
