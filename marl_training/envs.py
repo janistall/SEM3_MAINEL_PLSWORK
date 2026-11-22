@@ -170,6 +170,7 @@ class DroneSwarmEnv(_ParallelEnvBase):
         dt: float = 0.1,
         scenario_path: str | Path | None = None,
         shield: bool = True,
+        shield_off_prob: float = 0.0,
         randomize: bool = True,
         num_static_range: tuple[int, int] | None = None,
         num_dyn_range: tuple[int, int] | None = None,
@@ -203,6 +204,8 @@ class DroneSwarmEnv(_ParallelEnvBase):
         self.dt = float(dt)
         self.scenario_path = Path(scenario_path).expanduser() if scenario_path else None
         self.shield = bool(shield)
+        self.shield_off_prob = float(np.clip(shield_off_prob, 0.0, 1.0))
+        self._ep_shield = self.shield
         self.randomize = bool(randomize)
 
         resolved_static = (
@@ -503,6 +506,13 @@ class DroneSwarmEnv(_ParallelEnvBase):
         self._hold_counter = 0
         self._prev_actions.fill(0.0)
         self._goal_shifted = False
+        self._ep_shield = bool(
+            self.shield
+            and (
+                self.shield_off_prob <= 0.0
+                or float(self._rng.random()) >= self.shield_off_prob
+            )
+        )
 
         if self.scenario_path is not None and not self.randomize:
             self.starts, self.goals, self.obstacles = self._load_from_scenario(self.scenario_path)
@@ -671,7 +681,7 @@ class DroneSwarmEnv(_ParallelEnvBase):
             own = snapshot[i]
             peers = [snapshot[j] for j in range(self.num_drones) if j != i]
 
-            if self.shield:
+            if self._ep_shield:
                 res = safe_velocity(
                     own.position,
                     own.velocity,
@@ -786,13 +796,13 @@ class DroneSwarmEnv(_ParallelEnvBase):
                     docked_mask[i] = True
 
             if math.isfinite(min_pair_per_agent[i]):
-                r -= 2.0 * max(0.0, self.contract.pair_safe - min_pair_per_agent[i])
+                r -= 4.0 * max(0.0, self.contract.pair_safe - min_pair_per_agent[i])
             if math.isfinite(min_clearance_per_agent[i]):
-                r -= 2.0 * max(0.0, self.contract.obs_margin - min_clearance_per_agent[i])
+                r -= 4.0 * max(0.0, self.contract.obs_margin - min_clearance_per_agent[i])
             if per_agent_oob[i]:
                 r -= 2.0
             r -= 0.05 * action_jerks[i]
-            r -= 0.5 * interventions[i]
+            r -= 1.0 * interventions[i]
             rewards[agent_id] = float(r)
 
         # 5. Synchronized termination across all 10 drones (§8.4)

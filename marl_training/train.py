@@ -132,6 +132,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=True,
         help="Enable deployment CBF shield inside training environment",
     )
+    p.add_argument(
+        "--shield-off-prob",
+        type=float,
+        default=0.35,
+        help="Probability of disabling shield per training episode so the AI learns collision-free avoidance",
+    )
     p.add_argument("--eval-every", type=int, default=10)
     p.add_argument("--eval-episodes", type=int, default=5)
     p.add_argument("--checkpoint-every", type=int, default=10)
@@ -175,6 +181,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         max_steps=int(args.max_steps),
         scenario_path=scenario_path,
         shield=bool(args.shield),
+        shield_off_prob=float(args.shield_off_prob),
         randomize=bool(args.randomize),
         contract=contract,
         seed=int(args.seed),
@@ -332,6 +339,12 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
                 f"eval_dock={row['eval_fraction_docked']:.2f} "
                 f"eval_err={row['eval_final_slot_error']:.2f}m "
                 f"eval_inter={row['eval_mean_shield_intervention']:.4f}"
+                + (
+                    f" | L_off_succ={row['eval_shield_off_success_rate']:.2f} "
+                    f"L_off_coll={row['eval_shield_off_collision_rate']:.2f}"
+                    if "eval_shield_off_success_rate" in row
+                    else ""
+                )
                 if "eval_success_rate" in row
                 else ""
             ),
