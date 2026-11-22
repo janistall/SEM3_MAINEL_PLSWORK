@@ -395,28 +395,38 @@ class ActorPolicy:
         if not checkpoint.is_file():
             raise FileNotFoundError(f"policy checkpoint not found: {checkpoint}")
 
-        # TorchScript is preferred: it carries no arbitrary pickle state.
+        payload = None
         try:
-            scripted = torch.jit.load(str(checkpoint), map_location=self.device)
-            scripted.eval()
-            with torch.no_grad():
-                probe = scripted(torch.zeros(1, self.contract.obs_dim, device=self.device))
-            if tuple(probe.shape) != (1, self.contract.act_dim):
-                raise ValueError(
-                    f"TorchScript output shape {tuple(probe.shape)} != (1, {self.contract.act_dim})"
-                )
-            self.scripted = scripted
-            return
+            loaded = torch.load(str(checkpoint), map_location="cpu", weights_only=True)
+            if isinstance(loaded, dict):
+                payload = loaded
         except Exception:
-            pass
+            payload = None
 
-        try:
-            payload = torch.load(str(checkpoint), map_location="cpu", weights_only=True)
-        except Exception as exc:
-            raise ValueError(
-                "could not load checkpoint without executing pickle code; "
-                "export a clean deployment checkpoint via make_deploy_payload() or TorchScript"
-            ) from exc
+        if payload is None:
+            # Fallback to TorchScript module if the file is not a plain weights_only dict.
+            try:
+                import warnings
+
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", FutureWarning)
+                    scripted = torch.jit.load(str(checkpoint), map_location=self.device)
+                scripted.eval()
+                with torch.no_grad():
+                    probe = scripted(
+                        torch.zeros(1, self.contract.obs_dim, device=self.device)
+                    )
+                if tuple(probe.shape) != (1, self.contract.act_dim):
+                    raise ValueError(
+                        f"TorchScript output shape {tuple(probe.shape)} != (1, {self.contract.act_dim})"
+                    )
+                self.scripted = scripted
+                return
+            except Exception as exc:
+                raise ValueError(
+                    "could not load checkpoint without executing pickle code; "
+                    "export a clean deployment checkpoint via make_deploy_payload() or TorchScript"
+                ) from exc
 
         if isinstance(payload, dict) and "contract" in payload:
             meta = payload["contract"]

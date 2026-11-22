@@ -1,6 +1,6 @@
 # Project Plan — Decentralised UAV Swarm with MARL
 
-**Status:** Phase 1 & Cross-Team Interface Freeze implemented and verified (see **THIS IS WHAT WAS DONE SO FAR** below). Phases 2–8 pending.
+**Status:** Phases 1 & 2 + Cross-Team Interface Freeze implemented and verified (see **THIS IS WHAT WAS DONE SO FAR** below). Phases 3–8 pending.
 **Scope:** make the neural policy the actual controller of the swarm, **start directly with 10 drones on Contract v2 (`swarm-coop-enu-v2`)** (skipping an intermediate 3-drone v1 training cycle), allow runtime target selection, and demonstrate robustness to rain / birds / obstacles.
 **Audience:** all four team members.
 
@@ -35,6 +35,12 @@
 6. **Phase 1 Unit & Contract v2 Parity Test Harness in `src/swarm_control/test/`:**
    - Updated `test_control.py` for 62-D v2 observations and unified shield hard-backstop boundaries.
    - Added `test_contract_v2_parity.py` covering import identity, computed `obs_dim`, 50 randomized 10-drone parity scenarios, `agent_id` tie-breaking, action scaling/clipping parity, hardcoded 62-D & 4-D golden vectors, `ShieldConfig.from_contract()` + `dynamic_obstacles` CBF enforcement, metadata/key validation, frozen ROS 2 `.msg`/`.srv` existence, and PyTorch `ActorPolicy(..., weights_only=True)` round-trip tests.
+
+7. **Phase 2 — 10-Drone Contract v2 Training Environment (`marl_training/envs.py` + `src/swarm_control/test/test_env_v2.py`):**
+   - Rewrote `DroneSwarmEnv` (`drone_swarm_enu_v2`, 10 agents `drone_0..drone_9`) calling `swarm_control` deployment functions (`build_observation`, `action_to_velocity`, `safe_velocity(..., dynamic_obstacles=...)`) directly.
+   - Implemented `generate_formation_slots(num_drones=10, shape="ring"|"grid"|"v", spacing>=1.5, heading=...)` with guaranteed pairwise slot spacing.
+   - Added 4-stage curriculum presets (`STAGE_CONFIGS`: `stage1_open`, `stage2_static`, `stage3_dynamic`, `stage4_domain_rand`), static cylinders (`0..15`), crossing dynamic birds (`0..4` with arena bounce), mid-episode formation goal shifts (`goal_change_prob`), domain randomisation (actuator lag `lag_tau in [0.1, 0.3]`, wind gusts, odometry noise, `0..30%` peer telemetry dropout, `0..200 ms` peer latency), `scenario_path` JSON loading, the §8.3 per-slot reward, and §8.4 synchronized 10-drone termination (`success`, `collision`, `out_of_bounds`, or 600-step `truncation`).
+   - Added `src/swarm_control/test/test_env_v2.py` verifying 10-drone reset & stepping, formation shapes/spacing, all 4 curriculum stages + mid-episode target shift, synchronized collision/OOB/success termination, and `scenario.json` loading.
 
 ---
 
