@@ -263,7 +263,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
                 num_drones=int(args.num_drones),
                 max_steps=int(args.max_steps),
                 episodes=int(args.eval_episodes),
-                mode="clean",
+                stage=str(args.stage),
                 shield=True,
                 scenario_path=scenario_path,
                 contract=contract,
@@ -277,7 +277,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
                     num_drones=int(args.num_drones),
                     max_steps=int(args.max_steps),
                     episodes=max(1, int(args.eval_episodes) // 2),
-                    mode="clean",
+                    stage=str(args.stage),
                     shield=False,
                     scenario_path=scenario_path,
                     contract=contract,
@@ -329,6 +329,8 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
             f"kl={row['approx_kl']:.4f}"
             + (
                 f" | eval_succ={row['eval_success_rate']:.2f} "
+                f"eval_dock={row['eval_fraction_docked']:.2f} "
+                f"eval_err={row['eval_final_slot_error']:.2f}m "
                 f"eval_inter={row['eval_mean_shield_intervention']:.4f}"
                 if "eval_success_rate" in row
                 else ""

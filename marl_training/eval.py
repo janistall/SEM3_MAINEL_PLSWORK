@@ -107,19 +107,31 @@ def evaluate_policy(
     episodes: int = 5,
     seeds: Sequence[int] | None = None,
     mode: str = "clean",
+    stage: str | None = None,
     shield: bool = True,
     scenario_path: str | Path | None = None,
     contract: Contract = DEFAULT_CONTRACT,
 ) -> dict[str, float]:
     """Run deterministic evaluation episodes and return the 11 §10.3 metrics."""
-    env = _make_env_for_mode(
-        mode,
-        num_drones=num_drones,
-        max_steps=max_steps,
-        shield=shield,
-        scenario_path=scenario_path,
-        contract=contract,
-    )
+    if stage is not None:
+        env = DroneSwarmEnv.for_stage(
+            stage,
+            num_drones=num_drones,
+            max_steps=max_steps,
+            scenario_path=scenario_path,
+            randomize=scenario_path is None,
+            shield=shield,
+            contract=contract,
+        )
+    else:
+        env = _make_env_for_mode(
+            mode,
+            num_drones=num_drones,
+            max_steps=max_steps,
+            shield=shield,
+            scenario_path=scenario_path,
+            contract=contract,
+        )
     if seeds is None:
         seed_list = [7 + k for k in range(int(episodes))]
     else:

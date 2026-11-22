@@ -811,6 +811,15 @@ class DroneSwarmEnv(_ParallelEnvBase):
         swarm_oob = bool(np.any(per_agent_oob))
         swarm_success = bool(self._hold_counter >= self.hold_dwell)
 
+        # Terminal bonuses/penalties so finishing swarm_success early strictly beats
+        # farming the +0.6/step hold bonus (0.6 / (1 - 0.99) = 60.0 discounted max).
+        if swarm_success:
+            for agent_id in self.possible_agents:
+                rewards[agent_id] += 80.0
+        elif swarm_collision:
+            for agent_id in self.possible_agents:
+                rewards[agent_id] -= 20.0
+
         synchronized_terminated = bool(swarm_collision or swarm_oob or swarm_success)
         synchronized_truncated = bool(
             (not synchronized_terminated) and (self._step_count >= self.max_steps)
