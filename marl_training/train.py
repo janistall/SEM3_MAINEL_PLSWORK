@@ -1,111 +1,363 @@
-"""Run MADDPG on DroneSwarmEnv with Ray RLlib.
+"""Pure-PyTorch 10-drone MAPPO training driver with 4-stage curriculum and dual checkpoint export.
 
-Usage (from the repo root):
-    python -m marl_training.train --iters 200 --num-drones 3
-Policy checkpoints (.pt) are written ONLY to marl_training/weights/.
+Exports two strictly separated checkpoint formats (PROJECT_PLAN.md §10.4):
+  1. `swarm_policy_best.pt` / `swarm_policy_final.pt` : clean `weights_only=True` deployment file
+     containing only `contract` metadata, bare `actor.net` state_dict, and integer dimensions.
+  2. `train_state_latest.pt` / `train_state_iterNNNNN.pt` : full resumable training snapshot
+     (actor + log_std, centralized critic, Adam optimizer, counters, best success, and RNG state).
 """
-import argparse
-import os
-import sys
+from __future__ import annotations
 
+import argparse
+import json
+from dataclasses import replace
+from pathlib import Path
+from typing import Any, Sequence
+
+import numpy as np
 import torch
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.insert(0, ROOT)
-
-import ray  # noqa: E402
-from ray.rllib.env.wrappers.pettingzoo_env import ParallelPettingZooEnv  # noqa: E402
-from ray.rllib.models import ModelCatalog  # noqa: E402
-from ray.tune.registry import register_env  # noqa: E402
-
-from common.contracts import ACTION_DIM, OBS_DIM  # noqa: E402
-from marl_training.envs import DroneSwarmEnv  # noqa: E402
-from marl_training.maddpg import POLICY_ID, MADDPGConfig  # noqa: E402
-from marl_training.models import SwarmMADDPGModel  # noqa: E402
-
-WEIGHTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights")
-ENV_NAME = "drone_swarm_v0"
-MODEL_NAME = "swarm_maddpg_model"
+from marl_training.contracts import Contract, DEFAULT_CONTRACT, make_deploy_payload
+from marl_training.envs import DroneSwarmEnv, STAGE_CONFIGS
+from marl_training.eval import evaluate_policy
+from marl_training.mappo import MAPPOTrainer
 
 
-def find_key(d, key):
-    """Recursively look up ``key`` in the (nested) RLlib result dict."""
-    if isinstance(d, dict):
-        if key in d:
-            return d[key]
-        for v in d.values():
-            r = find_key(v, key)
-            if r is not None:
-                return r
-    return None
-
-
-def save_pt(algo, num_drones, tag):
-    """Save actor/critic weights as .pt files inside marl_training/weights/."""
-    os.makedirs(WEIGHTS_DIR, exist_ok=True)
-    model = algo.get_policy(POLICY_ID).model
-    ckpt = {
-        "actor": {k: v.cpu() for k, v in model.actor.state_dict().items()},
-        "critic": {k: v.cpu() for k, v in model.critic.state_dict().items()},
-        "obs_dim": OBS_DIM, "action_dim": ACTION_DIM, "num_drones": num_drones,
-    }
-    path = os.path.join(WEIGHTS_DIR, f"maddpg_{tag}.pt")
-    torch.save(ckpt, path)
-    # actor-only file: the only thing needed for decentralised deployment
-    torch.save({"actor": ckpt["actor"], "obs_dim": OBS_DIM, "action_dim": ACTION_DIM},
-               os.path.join(WEIGHTS_DIR, "actor_latest.pt"))
-    return path
-
-
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--iters", type=int, default=200)
-    p.add_argument("--num-drones", type=int, default=3)
-    p.add_argument("--max-steps", type=int, default=500)
-    p.add_argument("--num-env-runners", type=int, default=0)
-    p.add_argument("--checkpoint-every", type=int, default=20)
-    p.add_argument("--learning-starts", type=int, default=2000)
-    p.add_argument("--collision-penalty", type=float, default=50.0)
-    args = p.parse_args()
-
-    ray.init(ignore_reinit_error=True, include_dashboard=False)
-    register_env(ENV_NAME, lambda cfg: ParallelPettingZooEnv(DroneSwarmEnv(**cfg)))
-    ModelCatalog.register_custom_model(MODEL_NAME, SwarmMADDPGModel)
-
-    config = (
-        MADDPGConfig()
-        .environment(ENV_NAME, env_config={
-            "num_drones": args.num_drones,
-            "max_steps": args.max_steps,
-            "collision_penalty": args.collision_penalty,
-        })
-        .framework("torch")
-        .env_runners(num_env_runners=args.num_env_runners, rollout_fragment_length=args.max_steps)
-        .multi_agent(policies={POLICY_ID},
-                     policy_mapping_fn=lambda agent_id, *a, **kw: POLICY_ID)
-        .training(num_drones=args.num_drones, learning_starts=args.learning_starts,
-                  model={"custom_model": MODEL_NAME,
-                         "custom_model_config": {"num_drones": args.num_drones}})
+def save_deploy_pt(
+    trainer: MAPPOTrainer,
+    contract: Contract,
+    path: str | Path,
+    *,
+    steps: int,
+    seed: int,
+    stage: str,
+    note: str,
+) -> Path:
+    """Save a clean `weights_only=True` deployment checkpoint for ROS 2 `ActorPolicy`."""
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = make_deploy_payload(
+        contract,
+        trainer.actor.net.state_dict(),
+        algo="mappo_ctde_shared",
+        training_steps=int(steps),
+        seed=int(seed),
+        stage=str(stage),
+        note=str(note),
     )
-    # MADDPG here runs on the (old) RLlib API stack with TorchModelV2.
-    config.api_stack(enable_rl_module_and_learner=False,
-                     enable_env_runner_and_connector_v2=False)
+    torch.save(payload, target)
+    return target
 
-    algo = config.build_algo() if hasattr(config, "build_algo") else config.build()
-    for i in range(1, args.iters + 1):
-        res = algo.train()
-        reward = find_key(res, "episode_reward_mean")
-        if reward is None:
-            reward = find_key(res, "sampled_team_reward_mean")
-        print(f"[iter {i:4d}] steps={find_key(res, 'env_steps_total')} reward={reward} "
-              f"critic_loss={find_key(res, 'critic_loss')} actor_loss={find_key(res, 'actor_loss')}",
-              flush=True)
-        if i % args.checkpoint_every == 0:
-            print("  saved", save_pt(algo, args.num_drones, f"iter{i:05d}"), flush=True)
-    print("final:", save_pt(algo, args.num_drones, "final"))
-    algo.stop()
-    ray.shutdown()
+
+def save_train_state_pt(
+    trainer: MAPPOTrainer,
+    contract: Contract,
+    out_dir: str | Path,
+    *,
+    iteration: int,
+    env_steps: int,
+    stage: str,
+    best_success: float,
+    best_docked: float,
+    best_reward: float,
+    seed: int,
+    keep_last: int = 3,
+) -> Path:
+    """Save a full resumable training snapshot (`train_state_latest.pt` + rolling `train_state_iterNNNNN.pt`)."""
+    folder = Path(out_dir).expanduser()
+    folder.mkdir(parents=True, exist_ok=True)
+    meta = contract.as_dict()
+    meta.update(
+        {
+            "algo": "mappo_ctde_shared",
+            "training_steps": int(env_steps),
+            "seed": int(seed),
+            "stage": str(stage),
+        }
+    )
+    state = {
+        "contract": meta,
+        **trainer.state_dict(),
+        "iteration": int(iteration),
+        "env_steps": int(env_steps),
+        "stage": str(stage),
+        "best_success": float(best_success),
+        "best_docked": float(best_docked),
+        "best_reward": float(best_reward),
+        "rng_torch": torch.get_rng_state(),
+        "rng_numpy": np.random.get_state(),
+    }
+    latest_path = folder / "train_state_latest.pt"
+    iter_path = folder / f"train_state_iter{int(iteration):05d}.pt"
+    torch.save(state, latest_path)
+    torch.save(state, iter_path)
+
+    # Prune older periodic snapshots, keeping only the most recent `keep_last`
+    if keep_last > 0:
+        snapshots = sorted(folder.glob("train_state_iter*.pt"))
+        for old_path in snapshots[:-int(keep_last)]:
+            try:
+                old_path.unlink()
+            except OSError:
+                pass
+    return latest_path
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--iters", type=int, default=300)
+    p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--num-drones", type=int, default=10)
+    p.add_argument("--max-steps", type=int, default=600)
+    p.add_argument("--rollout-steps", type=int, default=2400)
+    p.add_argument("--ppo-epochs", type=int, default=6)
+    p.add_argument("--minibatch-size", type=int, default=1024)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument(
+        "--anneal-lr",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Linearly anneal learning rate across iterations",
+    )
+    p.add_argument("--scenario", default="", help="Optional fixed scenario.json path")
+    p.add_argument(
+        "--randomize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Randomize formations and obstacle layouts during training",
+    )
+    p.add_argument(
+        "--shield",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable deployment CBF shield inside training environment",
+    )
+    p.add_argument("--eval-every", type=int, default=10)
+    p.add_argument("--eval-episodes", type=int, default=5)
+    p.add_argument("--checkpoint-every", type=int, default=10)
+    p.add_argument("--keep-last-snapshots", type=int, default=3)
+    p.add_argument(
+        "--out",
+        default="marl_training/runs/exp01_stage1_open",
+        help="Output directory for checkpoints and metrics.jsonl",
+    )
+    p.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
+    p.add_argument("--resume", default="", help="Resume training state from train_state_latest.pt")
+    p.add_argument(
+        "--init-weights",
+        default="",
+        help="Initialize actor/critic weights from previous curriculum stage snapshot",
+    )
+    p.add_argument(
+        "--stage",
+        default="stage1_open",
+        choices=tuple(STAGE_CONFIGS.keys()),
+        help="Four-stage curriculum preset (always at N=10)",
+    )
+    return p
+
+
+def run_training(args: argparse.Namespace) -> dict[str, Any]:
+    if args.device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device = args.device
+
+    torch.manual_seed(int(args.seed))
+    np.random.seed(int(args.seed))
+    rng = np.random.default_rng(int(args.seed))
+
+    contract = replace(DEFAULT_CONTRACT, agents=int(args.num_drones))
+    scenario_path = args.scenario.strip() or None
+
+    env = DroneSwarmEnv(
+        num_drones=int(args.num_drones),
+        max_steps=int(args.max_steps),
+        scenario_path=scenario_path,
+        shield=bool(args.shield),
+        randomize=bool(args.randomize),
+        contract=contract,
+        seed=int(args.seed),
+        stage=str(args.stage),
+    )
+
+    trainer = MAPPOTrainer(
+        contract=contract,
+        hidden=contract.hidden,
+        lr=float(args.lr),
+        ppo_epochs=int(args.ppo_epochs),
+        minibatch_size=int(args.minibatch_size),
+        device=device,
+    )
+
+    start_iter = 1
+    env_steps_total = 0
+    best_success = -1.0
+    best_docked = -1.0
+    best_reward = float("-inf")
+
+    if args.init_weights:
+        init_path = Path(args.init_weights).expanduser()
+        payload = torch.load(str(init_path), map_location="cpu", weights_only=False)
+        trainer.load_state_dict(payload, load_optimizer=False)
+
+    if args.resume:
+        resume_path = Path(args.resume).expanduser()
+        payload = torch.load(str(resume_path), map_location="cpu", weights_only=False)
+        trainer.load_state_dict(payload, load_optimizer=True)
+        start_iter = int(payload.get("iteration", 0)) + 1
+        env_steps_total = int(payload.get("env_steps", 0))
+        best_success = float(payload.get("best_success", -1.0))
+        best_docked = float(payload.get("best_docked", -1.0))
+        best_reward = float(payload.get("best_reward", float("-inf")))
+        if "rng_torch" in payload:
+            try:
+                torch.set_rng_state(payload["rng_torch"].cpu())
+            except Exception:
+                pass
+        if "rng_numpy" in payload:
+            try:
+                np.random.set_state(payload["rng_numpy"])
+            except Exception:
+                pass
+
+    out_dir = Path(args.out).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = out_dir / "metrics.jsonl"
+
+    last_row: dict[str, Any] = {}
+    for i in range(start_iter, int(args.iters) + 1):
+        if args.anneal_lr and int(args.iters) > 1:
+            frac = 1.0 - (i - 1) / float(args.iters)
+            trainer.set_lr(max(1e-5, float(args.lr) * frac))
+
+        rollout_seed = int(args.seed) + i * 100
+        buffer, rollout_stats = trainer.collect_rollout(
+            env, rollout_steps=int(args.rollout_steps), seed=rollout_seed
+        )
+        env_steps_total += int(args.rollout_steps)
+        ppo_stats = trainer.update(buffer, rng=rng)
+
+        row: dict[str, Any] = {
+            "iter": int(i),
+            "env_steps_total": int(env_steps_total),
+            "stage": str(args.stage),
+            "lr": float(trainer.lr),
+            **rollout_stats,
+            **ppo_stats,
+        }
+
+        is_eval_iter = (int(args.eval_every) > 0 and i % int(args.eval_every) == 0) or (
+            i == int(args.iters)
+        )
+        if is_eval_iter:
+            eval_metrics = evaluate_policy(
+                trainer.act_deterministic,
+                num_drones=int(args.num_drones),
+                max_steps=int(args.max_steps),
+                episodes=int(args.eval_episodes),
+                mode="clean",
+                shield=True,
+                scenario_path=scenario_path,
+                contract=contract,
+            )
+            for k, v in eval_metrics.items():
+                row[f"eval_{k}"] = v
+
+            if int(args.eval_every) > 0 and i % (2 * int(args.eval_every)) == 0:
+                eval_off = evaluate_policy(
+                    trainer.act_deterministic,
+                    num_drones=int(args.num_drones),
+                    max_steps=int(args.max_steps),
+                    episodes=max(1, int(args.eval_episodes) // 2),
+                    mode="clean",
+                    shield=False,
+                    scenario_path=scenario_path,
+                    contract=contract,
+                )
+                row["eval_shield_off_success_rate"] = eval_off["success_rate"]
+                row["eval_shield_off_collision_rate"] = eval_off["collision_rate"]
+
+            curr_succ = float(eval_metrics["success_rate"])
+            curr_dock = float(eval_metrics["fraction_docked"])
+            curr_rew = float(row["episode_reward_mean"])
+            if (curr_succ, curr_dock, curr_rew) >= (best_success, best_docked, best_reward):
+                best_success = curr_succ
+                best_docked = curr_dock
+                best_reward = curr_rew
+                save_deploy_pt(
+                    trainer,
+                    contract,
+                    out_dir / "swarm_policy_best.pt",
+                    steps=env_steps_total,
+                    seed=int(args.seed),
+                    stage=str(args.stage),
+                    note=f"best eval_success_rate={best_success:.3f} at iter {i}",
+                )
+
+        with metrics_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+
+        if (int(args.checkpoint_every) > 0 and i % int(args.checkpoint_every) == 0) or (
+            i == int(args.iters)
+        ):
+            save_train_state_pt(
+                trainer,
+                contract,
+                out_dir,
+                iteration=i,
+                env_steps=env_steps_total,
+                stage=str(args.stage),
+                best_success=best_success,
+                best_docked=best_docked,
+                best_reward=best_reward,
+                seed=int(args.seed),
+                keep_last=int(args.keep_last_snapshots),
+            )
+
+        print(
+            f"[iter {i:4d}/{args.iters}] steps={env_steps_total} stage={args.stage} "
+            f"rew={row['episode_reward_mean']:.2f} docked={row['train_fraction_docked']:.2f} "
+            f"pi_loss={row['policy_loss']:.4f} v_loss={row['value_loss']:.4f} "
+            f"kl={row['approx_kl']:.4f}"
+            + (
+                f" | eval_succ={row['eval_success_rate']:.2f} "
+                f"eval_inter={row['eval_mean_shield_intervention']:.4f}"
+                if "eval_success_rate" in row
+                else ""
+            ),
+            flush=True,
+        )
+        last_row = row
+
+    save_deploy_pt(
+        trainer,
+        contract,
+        out_dir / "swarm_policy_final.pt",
+        steps=env_steps_total,
+        seed=int(args.seed),
+        stage=str(args.stage),
+        note=f"final checkpoint at iter {args.iters}",
+    )
+    if not (out_dir / "swarm_policy_best.pt").is_file():
+        save_deploy_pt(
+            trainer,
+            contract,
+            out_dir / "swarm_policy_best.pt",
+            steps=env_steps_total,
+            seed=int(args.seed),
+            stage=str(args.stage),
+            note=f"fallback best checkpoint at iter {args.iters}",
+        )
+    return last_row
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    run_training(args)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

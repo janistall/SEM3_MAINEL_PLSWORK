@@ -1,6 +1,6 @@
 # Project Plan — Decentralised UAV Swarm with MARL
 
-**Status:** Phases 1 & 2 + Cross-Team Interface Freeze implemented and verified (see **THIS IS WHAT WAS DONE SO FAR** below). Phases 3–8 pending.
+**Status:** Phases 1, 2, 3, 4 + Steps 2 & 3 (10-drone Scenario/World + 3-D Slack QP Shield + Colab Package) implemented and verified (see **THIS IS WHAT WAS DONE SO FAR** below). Phases 5–8 (ROS 2 deployment node hooks, formation allocator, fault injectors, SITL training/ablation) pending.
 **Scope:** make the neural policy the actual controller of the swarm, **start directly with 10 drones on Contract v2 (`swarm-coop-enu-v2`)** (skipping an intermediate 3-drone v1 training cycle), allow runtime target selection, and demonstrate robustness to rain / birds / obstacles.
 **Audience:** all four team members.
 
@@ -19,9 +19,10 @@
    - Added optional `agent_id: str = ""` to `Telemetry` and introduced `DynamicObstacle(position, velocity, radius=0.35, active=True)`.
    - Implemented `build_observation(agent_index, telemetry, goal, obstacles=(), contract=DEFAULT_CONTRACT, dynamic_obstacles=())` with nearest-4 active peers sorted by `(dist_3d, agent_id, index)`, nearest-3 static obstacles sorted by `(dist_2d - o.radius, index)`, nearest-2 active dynamic obstacles sorted by `(dist_3d - d.radius, index)`, explicit `valid` flags, and strict zero-padding (including `clearance = 0.0`).
 
-3. **Unified Shield Config & Frozen `safe_velocity()` Signature in `src/swarm_control/swarm_control/safety.py`:**
+3. **Step 3 — Upgraded Shield (`src/swarm_control/swarm_control/safety.py`):**
    - Updated `ShieldConfig` defaults to v2 (`speed=1.5`, `accel=2.0`, `pair_safe=0.9`, `radius=0.45`, `obstacle_margin=0.0`, `workspace=±15 m`) and added `ShieldConfig.from_contract(contract)`.
-   - Locked `safe_velocity(..., dynamic_obstacles: Sequence[DynamicObstacle] = ())` signature and added the moving-obstacle CBF constraint (`n · (v_i - v_o) >= -alpha * (||p_i - p_o|| - r_o - r_i - margin)`) so Phase 2 (`envs.py`) and Step 3 (`safety.py` QP upgrade) can proceed in parallel without signature drift.
+   - Locked `safe_velocity(..., dynamic_obstacles: Sequence[DynamicObstacle] = ())` signature with moving-obstacle CBF (`n · (v_i - v_o) >= -alpha * (||p_i - p_o|| - r_o - r_i - margin)`) and optional `lookahead_tau`.
+   - Implemented the **fast-path zero-violation check** (skips solver when `v_box` satisfies all constraints), **pure-NumPy prioritized-slack 3-D QP** (`weight_peer=400 > weight_dyn=300 > weight_static=250 > weight_workspace=150`), and **active brake/retreat fallback** when inside a hard collision envelope (`feasible=False` with a non-zero separating velocity instead of freezing at `[0, 0, 0]`).
 
 4. **Single-Source-of-Truth Training Re-export in `marl_training/contracts.py` (+ `marl_training/__init__.py`):**
    - Replaced the divergent Gen-1 `marl_training/contracts.py` with a direct re-export of `swarm_control.contract`, `swarm_control.observation`, and `swarm_control.safety`.
@@ -32,15 +33,22 @@
    - Registered all new interfaces in `src/swarm_interfaces/CMakeLists.txt`.
    - Locked `node.py` single-owner integration order (M1 integrates Phase 5 → 6 → 7 → 8 hooks).
 
-6. **Phase 1 Unit & Contract v2 Parity Test Harness in `src/swarm_control/test/`:**
-   - Updated `test_control.py` for 62-D v2 observations and unified shield hard-backstop boundaries.
-   - Added `test_contract_v2_parity.py` covering import identity, computed `obs_dim`, 50 randomized 10-drone parity scenarios, `agent_id` tie-breaking, action scaling/clipping parity, hardcoded 62-D & 4-D golden vectors, `ShieldConfig.from_contract()` + `dynamic_obstacles` CBF enforcement, metadata/key validation, frozen ROS 2 `.msg`/`.srv` existence, and PyTorch `ActorPolicy(..., weights_only=True)` round-trip tests.
+6. **Step 2 — 10-Drone Scenario & Gazebo World Generator (`src/swarm_bringup/swarm_bringup/scenario.py` + `src/swarm_control/swarm_control/planning.py`):**
+   - Expanded `astar()` default bounds in `planning.py` to `(-14.8, 14.8)` for the `±15 m` 10-drone arena.
+   - Upgraded `scenario.py` with `formation_slots(count=10, shape="ring"|"grid"|"v", spacing=1.6)`, 10-drone A*-reachable map sampling, `-15..15` ground grid, `>= 4.0 m` start/goal zone discs, and a 10-color beacon palette.
+   - Regenerated both packaged `src/swarm_bringup/config/scenario.json` and `src/swarm_bringup/worlds/swarm.sdf` together for 10 drones (`seed=7, obstacles=7`).
 
 7. **Phase 2 — 10-Drone Contract v2 Training Environment (`marl_training/envs.py` + `src/swarm_control/test/test_env_v2.py`):**
    - Rewrote `DroneSwarmEnv` (`drone_swarm_enu_v2`, 10 agents `drone_0..drone_9`) calling `swarm_control` deployment functions (`build_observation`, `action_to_velocity`, `safe_velocity(..., dynamic_obstacles=...)`) directly.
-   - Implemented `generate_formation_slots(num_drones=10, shape="ring"|"grid"|"v", spacing>=1.5, heading=...)` with guaranteed pairwise slot spacing.
-   - Added 4-stage curriculum presets (`STAGE_CONFIGS`: `stage1_open`, `stage2_static`, `stage3_dynamic`, `stage4_domain_rand`), static cylinders (`0..15`), crossing dynamic birds (`0..4` with arena bounce), mid-episode formation goal shifts (`goal_change_prob`), domain randomisation (actuator lag `lag_tau in [0.1, 0.3]`, wind gusts, odometry noise, `0..30%` peer telemetry dropout, `0..200 ms` peer latency), `scenario_path` JSON loading, the §8.3 per-slot reward, and §8.4 synchronized 10-drone termination (`success`, `collision`, `out_of_bounds`, or 600-step `truncation`).
-   - Added `src/swarm_control/test/test_env_v2.py` verifying 10-drone reset & stepping, formation shapes/spacing, all 4 curriculum stages + mid-episode target shift, synchronized collision/OOB/success termination, and `scenario.json` loading.
+   - Implemented `generate_formation_slots`, 4-stage curriculum presets (`STAGE_CONFIGS`), static cylinders (`0..15`), crossing dynamic birds (`0..4` with arena bounce), mid-episode formation goal shifts, domain randomisation (`lag_tau`, wind gusts, odometry noise, `0..30%` peer dropout, `0..200 ms` latency), `scenario_path` JSON loading, the §8.3 per-slot reward, and §8.4 synchronized 10-drone termination.
+
+8. **Phase 3 & Phase 4 (+ Step 7 Colab Package) — Pure-PyTorch Parameter-Shared MAPPO Training Stack:**
+   - Rewrote `marl_training/models.py` (`SwarmActorNet` `62→256→256→4` with bare `nn.Sequential` `self.net` + clamped `log_std`, and `CentralizedValueNet` `682→256→256→1` with zero Ray RLlib dependency).
+   - Created `marl_training/mappo.py` (`RolloutBuffer` with unclipped `raw_actions`, GAE with truncation `V(s_next)` bootstrapping vs. termination zeroing, and `MAPPOTrainer` with clipped PPO + resumable `state_dict`).
+   - Rewrote `marl_training/train.py` (4-stage curriculum CLI, `<out>/metrics.jsonl`, deterministic evaluation + shield-off pass, dual checkpoint export `swarm_policy_best.pt` / `swarm_policy_final.pt` vs. `train_state_latest.pt` / rolling last-3 `train_state_iterNNNNN.pt`, `--resume`, `--init-weights`).
+   - Created `marl_training/eval.py` (headless kinematic evaluator for `clean`, `rain`, `birds`, `clutter`, `target_change` with both `shield=True` and `shield=False`).
+   - Added `requirements-colab.txt`, updated `marl_training/requirements.txt` (removed `ray[rllib]`), and created the 9-cell `marl_training/colab_train.ipynb` pointing to `https://github.com/janistall/SEM3_MAINEL_PLSWORK.git`.
+   - Added `src/swarm_control/test/test_mappo_and_steps_2_3.py` (all 24 unit, parity, environment, scenario, QP shield, and MAPPO training/eval tests pass).
 
 ---
 

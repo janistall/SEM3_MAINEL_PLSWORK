@@ -125,7 +125,9 @@ def test_shield_requires_separation_when_inside_pair_envelope():
         cfg,
     )
     assert not result.feasible
-    assert np.linalg.norm(result.velocity) <= 1e-9
+    # Step 3 retreat-on-infeasible fallback: actively retreats along -x away from peer at +0.5 x
+    assert result.velocity[0] < -0.1
+    assert np.isclose(result.velocity[0], -cfg.accel * 0.1)
 
 
 def test_shield_avoids_obstacle_cylinder():

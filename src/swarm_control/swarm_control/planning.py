@@ -31,8 +31,9 @@ def astar(
     obstacles: list[Obstacle],
     resolution: float = 0.4,
     margin: float = 1.3,
+    bounds: tuple[float, float] = (-14.8, 14.8),
 ) -> np.ndarray | None:
-    lo, hi = -9.2, 9.2
+    lo, hi = float(bounds[0]), float(bounds[1])
     size = int(round((hi - lo) / resolution)) + 1
 
     def cell(point) -> tuple[int, int]:

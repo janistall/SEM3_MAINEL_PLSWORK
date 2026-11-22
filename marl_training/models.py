@@ -1,87 +1,120 @@
-"""RLlib TorchModelV2 with a decentralised Actor and a centralised Critic (CTDE).
+"""Pure-PyTorch parameter-shared MAPPO actor and centralised value critic for Contract v2 (`N = 10`).
 
-* Actor  : local OBS_DIM observation -> ACTION_DIM action, Tanh-bounded to [-1, 1].
-* Critic : concat(obs of ALL drones, actions of ALL drones) -> scalar Q.
-Layer sizes are derived from ``common.contracts`` and ``num_drones``.
-Target networks (for MADDPG) are held in the same model so they travel with
-the policy's weights.
+* `SwarmActorNet`       : decentralised `obs_dim (62) -> 256 -> 256 -> act_dim (4)` Tanh MLP (`self.net`)
+                          plus a learnable 4-D `log_std` (clamped to `[-2.0, 0.0]`) for Gaussian exploration.
+                          `self.net.state_dict()` exports bare `nn.Sequential` keys (`0.weight`, `2.weight`,
+                          `4.weight`) that load directly into ROS 2 `ActorPolicy(..., weights_only=True)`.
+* `CentralizedValueNet` : CTDE state-value critic `V(s_all, o_i)` taking the concatenated observations of all
+                          `N` drones (`10 * 62 = 620`) plus own observation (`62`) -> `682 -> 256 -> 256 -> 1`.
 """
-import copy
-import os
-import sys
+from __future__ import annotations
+
+from typing import Sequence
 
 import torch
 import torch.nn as nn
-from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from common.contracts import ACTION_DIM, OBS_DIM  # noqa: E402
+from marl_training.contracts import ACT_DIM, N_AGENTS, OBS_DIM
 
 
-def _mlp(in_dim, out_dim, hidden, out_act=None):
-    layers, last = [], in_dim
+def _mlp(
+    in_dim: int,
+    out_dim: int,
+    hidden: Sequence[int] = (256, 256),
+    out_act: nn.Module | None = None,
+) -> nn.Sequential:
+    layers: list[nn.Module] = []
+    last = int(in_dim)
     for h in hidden:
-        layers += [nn.Linear(last, h), nn.ReLU()]
-        last = h
-    layers.append(nn.Linear(last, out_dim))
+        layers += [nn.Linear(last, int(h)), nn.ReLU()]
+        last = int(h)
+    layers.append(nn.Linear(last, int(out_dim)))
     if out_act is not None:
         layers.append(out_act)
     return nn.Sequential(*layers)
 
 
 class SwarmActorNet(nn.Module):
-    def __init__(self, hidden=(256, 256)):
-        super().__init__()
-        self.net = _mlp(OBS_DIM, ACTION_DIM, hidden, nn.Tanh())  # bounded [-1, 1]
+    """Parameter-shared decentralised actor for 10-drone MAPPO."""
 
-    def forward(self, obs):
+    def __init__(
+        self,
+        obs_dim: int = OBS_DIM,
+        act_dim: int = ACT_DIM,
+        hidden: Sequence[int] = (256, 256),
+        init_log_std: float = -0.5,
+    ):
+        super().__init__()
+        self.obs_dim = int(obs_dim)
+        self.act_dim = int(act_dim)
+        self.hidden = tuple(int(h) for h in hidden)
+        self.net = _mlp(self.obs_dim, self.act_dim, self.hidden, nn.Tanh())
+        self.log_std = nn.Parameter(torch.full((self.act_dim,), float(init_log_std)))
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
         return self.net(obs)
 
+    def deterministic(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.net(obs)
 
-class CentralizedCriticNet(nn.Module):
-    def __init__(self, num_drones, hidden=(256, 256)):
+    def dist(self, obs: torch.Tensor) -> torch.distributions.Normal:
+        mean = self.net(obs)
+        std = self.log_std.clamp(-2.0, 0.0).exp().expand_as(mean)
+        return torch.distributions.Normal(mean, std)
+
+    def act(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample unclipped `raw_action` and return `(raw_action, summed_log_prob)`."""
+        distribution = self.dist(obs)
+        raw_action = distribution.sample()
+        log_prob = distribution.log_prob(raw_action).sum(dim=-1)
+        return raw_action, log_prob
+
+    def evaluate_actions(
+        self, obs: torch.Tensor, raw_actions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return `(summed_log_prob, summed_entropy)` for unclipped `raw_actions`."""
+        distribution = self.dist(obs)
+        log_prob = distribution.log_prob(raw_actions).sum(dim=-1)
+        entropy = distribution.entropy().sum(dim=-1)
+        return log_prob, entropy
+
+
+class CentralizedValueNet(nn.Module):
+    """Centralised CTDE state-value critic `V(s_all, o_i)` (682-D input for N=10, obs_dim=62)."""
+
+    def __init__(
+        self,
+        num_drones: int = N_AGENTS,
+        obs_dim: int = OBS_DIM,
+        hidden: Sequence[int] = (256, 256),
+    ):
         super().__init__()
-        self.num_drones = num_drones
-        self.net = _mlp(OBS_DIM * num_drones + ACTION_DIM * num_drones, 1, hidden)
+        self.num_drones = int(num_drones)
+        self.obs_dim = int(obs_dim)
+        self.hidden = tuple(int(h) for h in hidden)
+        self.in_dim = self.obs_dim * self.num_drones + self.obs_dim
+        self.net = _mlp(self.in_dim, 1, self.hidden)
 
-    def forward(self, all_obs, all_actions):
-        """all_obs: [B, N*OBS_DIM]; all_actions: [B, N*ACTION_DIM]."""
-        return self.net(torch.cat([all_obs, all_actions], dim=-1))
+    def build_critic_inputs(self, obs_all: torch.Tensor) -> torch.Tensor:
+        """Convert `(..., N, obs_dim)` joint observations into `(..., N, N*obs_dim + obs_dim)`."""
+        if obs_all.shape[-2:] != (self.num_drones, self.obs_dim):
+            raise ValueError(
+                f"expected obs_all ending with ({self.num_drones}, {self.obs_dim}), "
+                f"got {tuple(obs_all.shape)}"
+            )
+        prefix = obs_all.shape[:-2]
+        global_flat = obs_all.reshape(*prefix, 1, self.num_drones * self.obs_dim).expand(
+            *prefix, self.num_drones, self.num_drones * self.obs_dim
+        )
+        return torch.cat([global_flat, obs_all], dim=-1)
 
-
-class SwarmMADDPGModel(TorchModelV2, nn.Module):
-    """Pass ``custom_model_config={"num_drones": N, "hidden": (256, 256)}``."""
-
-    def __init__(self, obs_space, action_space, num_outputs, model_config, name,
-                 num_drones=3, hidden=(256, 256), **kwargs):
-        TorchModelV2.__init__(self, obs_space, action_space, num_outputs, model_config, name)
-        nn.Module.__init__(self)
-        assert obs_space.shape == (OBS_DIM,), f"obs shape {obs_space.shape} != ({OBS_DIM},)"
-        assert action_space.shape == (ACTION_DIM,), f"action shape {action_space.shape} != ({ACTION_DIM},)"
-        self.num_drones = num_drones
-
-        self.actor = SwarmActorNet(hidden)
-        self.critic = CentralizedCriticNet(num_drones, hidden)
-        self.target_actor = copy.deepcopy(self.actor)
-        self.target_critic = copy.deepcopy(self.critic)
-        for p in list(self.target_actor.parameters()) + list(self.target_critic.parameters()):
-            p.requires_grad_(False)
-
-    def forward(self, input_dict, state, seq_lens):
-        """Decentralised execution: only the local observation is used."""
-        return self.actor(input_dict["obs_flat"].float()), state
-
-    def value_function(self):
-        raise NotImplementedError("MADDPG uses Q(s, a) via `critic`, not V(s).")
-
-    def actor_variables(self):
-        return list(self.actor.parameters())
-
-    def critic_variables(self):
-        return list(self.critic.parameters())
-
-    @torch.no_grad()
-    def soft_update_targets(self, tau):
-        for net, tgt in ((self.actor, self.target_actor), (self.critic, self.target_critic)):
-            for p, tp in zip(net.parameters(), tgt.parameters()):
-                tp.mul_(1.0 - tau).add_(p, alpha=tau)
+    def forward(
+        self, global_obs: torch.Tensor, own_obs: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if own_obs is not None:
+            joint = torch.cat([global_obs, own_obs], dim=-1)
+        elif global_obs.shape[-1] == self.in_dim:
+            joint = global_obs
+        else:
+            joint = self.build_critic_inputs(global_obs)
+        return self.net(joint).squeeze(-1)
