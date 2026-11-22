@@ -4,3 +4,12 @@ log/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Local archives, drafts, and intermediate training snapshots
+marl_training.zip
+MAINEL.md
+*.pdf
+*.docx
+marl_training/weights/*.pt
+marl_training/warning_must_read_before_proceeding.md
+train_state_*.pt

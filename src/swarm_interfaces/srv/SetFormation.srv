@@ -1,0 +1,7 @@
+geometry_msgs/PoseStamped center
+string shape
+float32 spacing
+---
+bool accepted
+string message
+geometry_msgs/Point[] slots

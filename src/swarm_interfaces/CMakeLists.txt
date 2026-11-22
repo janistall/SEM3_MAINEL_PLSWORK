@@ -13,6 +13,9 @@ find_package(geometry_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/AgentTelemetry.msg"
   "msg/NeighborList.msg"
+  "msg/DynamicObstacle.msg"
+  "msg/DynamicObstacleArray.msg"
+  "srv/SetFormation.srv"
   DEPENDENCIES std_msgs geometry_msgs
 )
 

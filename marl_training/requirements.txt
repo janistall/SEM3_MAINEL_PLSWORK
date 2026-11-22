@@ -1,0 +1,9 @@
+ray[rllib]>=2.40
+torch
+gymnasium>=0.28
+pettingzoo>=1.24
+numpy
+pandas
+pyarrow
+dm_tree
+scipy

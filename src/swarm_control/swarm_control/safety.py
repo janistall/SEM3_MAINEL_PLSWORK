@@ -1,22 +1,50 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Sequence
 
 import numpy as np
 
-from .observation import Obstacle, Telemetry
+from .contract import Contract, DEFAULT_CONTRACT
+from .observation import DynamicObstacle, Obstacle, Telemetry
 
 
 @dataclass
 class ShieldConfig:
-    speed: float = 0.8
-    accel: float = 1.2
-    pair_safe: float = 1.1
+    speed: float = 1.5
+    accel: float = 2.0
+    pair_safe: float = 0.9
     radius: float = 0.45
-    obstacle_margin: float = 0.25
-    workspace: tuple[tuple[float, float], ...] = ((-9.3, 9.3), (-9.3, 9.3), (0.35, 4.0))
+    obstacle_margin: float = 0.0
+    workspace: tuple[tuple[float, float], ...] = ((-15.0, 15.0), (-15.0, 15.0), (0.35, 4.0))
     alpha: float = 1.4
     iterations: int = 60
+
+    @classmethod
+    def from_contract(
+        cls,
+        contract: Contract = DEFAULT_CONTRACT,
+        *,
+        workspace: tuple[tuple[float, float], ...] | None = None,
+        alpha: float = 1.4,
+        iterations: int = 60,
+    ) -> "ShieldConfig":
+        """Build hard-backstop shield limits directly from a Contract."""
+        resolved_workspace = (
+            workspace
+            if workspace is not None
+            else ((-15.0, 15.0), (-15.0, 15.0), (0.35, max(4.0, float(contract.alt) + 1.5)))
+        )
+        return cls(
+            speed=float(contract.speed),
+            accel=float(contract.accel),
+            pair_safe=float(contract.hard_pair),
+            radius=float(contract.radius),
+            obstacle_margin=float(contract.hard_margin),
+            workspace=resolved_workspace,
+            alpha=float(alpha),
+            iterations=int(iterations),
+        )
 
 
 @dataclass
@@ -34,10 +62,11 @@ def safe_velocity(
     position: np.ndarray,
     velocity: np.ndarray,
     desired: np.ndarray,
-    peers: list[Telemetry],
-    obstacles: list[Obstacle],
+    peers: Sequence[Telemetry],
+    obstacles: Sequence[Obstacle],
     dt: float,
     config: ShieldConfig | None = None,
+    dynamic_obstacles: Sequence[DynamicObstacle] = (),
 ) -> ShieldResult:
     cfg = config or ShieldConfig()
     position = np.asarray(position, dtype=np.float64).reshape(3)
@@ -53,19 +82,38 @@ def safe_velocity(
     rhs: list[float] = []
 
     for peer in peers:
-        delta = position - peer.position
+        if not getattr(peer, "active", True):
+            continue
+        delta = position - np.asarray(peer.position, dtype=np.float64).reshape(3)
         distance = float(np.linalg.norm(delta))
         normal = delta / max(distance, 1e-9)
         rows.append(normal)
-        rhs.append(-cfg.alpha * (distance - cfg.pair_safe) + float(np.dot(normal, peer.velocity)))
+        rhs.append(
+            -cfg.alpha * (distance - cfg.pair_safe)
+            + float(np.dot(normal, np.asarray(peer.velocity, dtype=np.float64).reshape(3)))
+        )
 
     for obstacle in obstacles:
-        delta = position[:2] - np.array([obstacle.x, obstacle.y])
+        delta = position[:2] - np.array([obstacle.x, obstacle.y], dtype=np.float64)
         distance = float(np.linalg.norm(delta))
         normal = np.array([delta[0] / max(distance, 1e-9), delta[1] / max(distance, 1e-9), 0.0])
         rows.append(normal)
         rhs.append(
             -cfg.alpha * (distance - obstacle.radius - cfg.radius - cfg.obstacle_margin)
+        )
+
+    for dyn in dynamic_obstacles:
+        if not getattr(dyn, "active", True):
+            continue
+        dyn_pos = np.asarray(dyn.position, dtype=np.float64).reshape(3)
+        dyn_vel = np.asarray(dyn.velocity, dtype=np.float64).reshape(3)
+        delta = position - dyn_pos
+        distance = float(np.linalg.norm(delta))
+        normal = delta / max(distance, 1e-9)
+        rows.append(normal)
+        rhs.append(
+            -cfg.alpha * (distance - float(dyn.radius) - cfg.radius - cfg.obstacle_margin)
+            + float(np.dot(normal, dyn_vel))
         )
 
     for axis, (minimum, maximum) in enumerate(cfg.workspace):
