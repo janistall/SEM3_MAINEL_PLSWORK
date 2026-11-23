@@ -1,25 +1,30 @@
 """Headless kinematic evaluator and shield-ON vs. shield-OFF ablation runner for Contract v2 (`N = 10`).
 
 Computes all 11 evaluation metrics specified in PROJECT_PLAN.md §10.3 across test modes:
+  * `open`          : Stage 1 open arena (0 static cylinders, 0 dynamic obstacles, no disturbances)
   * `clean`         : baseline 10-drone scenario (7 static cylinders, no disturbances)
   * `rain`          : wind gusts + odometry noise + 20% peer telemetry dropout
   * `birds`         : 7 static cylinders + 3 crossing dynamic obstacles
   * `clutter`       : 15 static cylinders
   * `target_change` : mid-episode formation goal shift
+
+Also supports `--stage <curriculum_stage>` to mirror `marl_training/train.py` stage-matched evaluation.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import warnings
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
 import numpy as np
 
 from marl_training.contracts import ActorPolicy, Contract, DEFAULT_CONTRACT
-from marl_training.envs import DroneSwarmEnv
+from marl_training.envs import DroneSwarmEnv, STAGE_CONFIGS
 
-EVAL_MODES: tuple[str, ...] = ("clean", "rain", "birds", "clutter", "target_change")
+EVAL_MODES: tuple[str, ...] = ("open", "clean", "rain", "birds", "clutter", "target_change")
+OBSTACLE_MODES: frozenset[str] = frozenset({"clean", "rain", "birds", "clutter", "target_change"})
 
 
 def _make_env_for_mode(
@@ -32,6 +37,19 @@ def _make_env_for_mode(
     contract: Contract,
 ) -> DroneSwarmEnv:
     mode_key = mode.strip().lower()
+    if mode_key == "open":
+        return DroneSwarmEnv(
+            num_drones=num_drones,
+            max_steps=max_steps,
+            scenario_path=scenario_path,
+            randomize=scenario_path is None,
+            shield=shield,
+            num_static_range=(0, 0),
+            num_dyn_range=(0, 0),
+            goal_change_prob=0.0,
+            domain_rand=False,
+            contract=contract,
+        )
     if mode_key == "clean":
         return DroneSwarmEnv(
             num_drones=num_drones,
@@ -241,32 +259,71 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=["clean", "rain", "birds", "clutter", "target_change"],
         choices=EVAL_MODES,
     )
+    parser.add_argument(
+        "--stage",
+        default="",
+        choices=("", *STAGE_CONFIGS.keys()),
+        help=(
+            "Optional curriculum stage (e.g. stage1_open) to evaluate via "
+            "DroneSwarmEnv.for_stage instead of --modes"
+        ),
+    )
     parser.add_argument("--scenario", default="")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--out", default="", help="Optional path to write JSON report")
     args = parser.parse_args(argv)
 
     policy = ActorPolicy(args.checkpoint, device=args.device)
+    ckpt_stage = str(policy.metadata.get("stage", "") or "")
+    if ckpt_stage:
+        print(f"Loaded checkpoint trained on stage={ckpt_stage!r}", flush=True)
+
     if len(args.seeds) == 2 and args.seeds[1] >= args.seeds[0]:
         seeds = list(range(int(args.seeds[0]), int(args.seeds[1]) + 1))
     else:
         seeds = [int(s) for s in args.seeds]
 
     scenario_path = args.scenario.strip() or None
+    eval_stage = str(args.stage).strip() or None
     report: dict[str, Any] = {
         "checkpoint": str(args.checkpoint),
+        "checkpoint_stage": ckpt_stage,
         "contract": policy.contract.as_dict(),
         "results": {},
     }
 
-    for mode in args.modes:
+    if eval_stage is not None:
+        if ckpt_stage == "stage1_open" and eval_stage != "stage1_open":
+            msg = (
+                f"Checkpoint was trained on stage='stage1_open' (0 static obstacles), "
+                f"but is being evaluated on stage={eval_stage!r} which includes obstacles. "
+                f"Use '--stage stage1_open' or '--modes open' to evaluate Stage 1 performance."
+            )
+            warnings.warn(msg, UserWarning, stacklevel=2)
+            print(f"WARNING: {msg}", flush=True)
+        eval_targets: list[tuple[str, str, str | None]] = [(eval_stage, "clean", eval_stage)]
+    else:
+        obstacle_selected = [m for m in args.modes if m in OBSTACLE_MODES]
+        if ckpt_stage == "stage1_open" and obstacle_selected:
+            msg = (
+                f"Checkpoint was trained on stage='stage1_open' (0 static obstacles), "
+                f"but is being evaluated on obstacle mode(s) {obstacle_selected}. "
+                f"Untrained static-obstacle input weights typically cause poor docking/collisions; "
+                f"use '--stage stage1_open' or '--modes open' to evaluate Stage 1 performance."
+            )
+            warnings.warn(msg, UserWarning, stacklevel=2)
+            print(f"WARNING: {msg}", flush=True)
+        eval_targets = [(mode, mode, None) for mode in args.modes]
+
+    for label, mode_name, stage_name in eval_targets:
         res_on = evaluate_policy(
             policy,
             num_drones=args.num_drones,
             max_steps=args.max_steps,
             episodes=args.episodes,
             seeds=seeds,
-            mode=mode,
+            mode=mode_name,
+            stage=stage_name,
             shield=True,
             scenario_path=scenario_path,
             contract=policy.contract,
@@ -277,14 +334,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_steps=args.max_steps,
             episodes=args.episodes,
             seeds=seeds,
-            mode=mode,
+            mode=mode_name,
+            stage=stage_name,
             shield=False,
             scenario_path=scenario_path,
             contract=policy.contract,
         )
-        report["results"][mode] = {"L+S": res_on, "L": res_off}
+        report["results"][label] = {"L+S": res_on, "L": res_off}
         print(
-            f"[{mode:13s}] L+S success={res_on['success_rate']:.2f} "
+            f"[{label:13s}] L+S success={res_on['success_rate']:.2f} "
             f"(docked={res_on['fraction_docked']:.2f}, coll={res_on['collision_rate']:.2f}, "
             f"inter={res_on['mean_shield_intervention']:.4f}) | "
             f"L (shield OFF) success={res_off['success_rate']:.2f} "
