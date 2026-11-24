@@ -1,6 +1,6 @@
 # Project Plan — Decentralised UAV Swarm with MARL
 
-**Status:** Phases 1, 2, 3, 4 + Steps 2 & 3 (10-drone Scenario/World + 3-D Slack QP Shield + Colab Package) implemented and verified (see **THIS IS WHAT WAS DONE SO FAR** below). Phases 5–8 (ROS 2 deployment node hooks, formation allocator, fault injectors, SITL training/ablation) pending.
+**Status:** Phases 1–4 + Steps 2 & 3 (Contract v2, 10-drone Scenario/World, 3-D Slack QP Shield, Pure-PyTorch MAPPO Stack, Colab Package, and Stage 1 eval-mismatch fix `b311940`) implemented and verified (**all 25 regression tests passing**; pushed to `origin/feature/m1-m2-integration`). Stage 1 MAPPO training completed 250 iterations / 600,000 environment steps on Google Colab T4 GPU, but **Stage 1 acceptance criteria have NOT been met** and **Stage 2 training has NOT started**. M1 ROS 2 deployment integration (`node.py`, `swarm.launch.py`, Phase 7 allocator, Phase 8 ROS/Gazebo injectors, SITL) remains partially complete / pending (see **THIS IS WHAT WAS DONE SO FAR** and **M1 & M2 Implementation Status Audit** below).
 **Scope:** make the neural policy the actual controller of the swarm, **start directly with 10 drones on Contract v2 (`swarm-coop-enu-v2`)** (skipping an intermediate 3-drone v1 training cycle), allow runtime target selection, and demonstrate robustness to rain / birds / obstacles.
 **Audience:** all four team members.
 
@@ -40,15 +40,95 @@
 
 7. **Phase 2 — 10-Drone Contract v2 Training Environment (`marl_training/envs.py` + `src/swarm_control/test/test_env_v2.py`):**
    - Rewrote `DroneSwarmEnv` (`drone_swarm_enu_v2`, 10 agents `drone_0..drone_9`) calling `swarm_control` deployment functions (`build_observation`, `action_to_velocity`, `safe_velocity(..., dynamic_obstacles=...)`) directly.
-   - Implemented `generate_formation_slots`, 4-stage curriculum presets (`STAGE_CONFIGS`), static cylinders (`0..15`), crossing dynamic birds (`0..4` with arena bounce), mid-episode formation goal shifts, domain randomisation (`lag_tau`, wind gusts, odometry noise, `0..30%` peer dropout, `0..200 ms` latency), `scenario_path` JSON loading, the §8.3 per-slot reward, and §8.4 synchronized 10-drone termination.
+   - Implemented `generate_formation_slots`, 4-stage curriculum presets (`STAGE_CONFIGS`), static cylinders (`0..15`), crossing dynamic birds (`0..4` with arena bounce), mid-episode formation goal shifts, domain randomisation (`lag_tau`, wind gusts, odometry noise, `0..30%` peer dropout, `0..200 ms` latency), `scenario_path` JSON loading, per-slot reward shaping (including terminal `swarm_success` `+80` bonus, closing-speed/TTC avoidance shaping, per-culprit collision penalty, and `--shield-off-prob` episode sampling in commits `f331d6b`, `6e959c0`, `5a971c1`), and §8.4 synchronized 10-drone termination.
 
 8. **Phase 3 & Phase 4 (+ Step 7 Colab Package) — Pure-PyTorch Parameter-Shared MAPPO Training Stack:**
    - Rewrote `marl_training/models.py` (`SwarmActorNet` `62→256→256→4` with bare `nn.Sequential` `self.net` + clamped `log_std`, and `CentralizedValueNet` `682→256→256→1` with zero Ray RLlib dependency).
    - Created `marl_training/mappo.py` (`RolloutBuffer` with unclipped `raw_actions`, GAE with truncation `V(s_next)` bootstrapping vs. termination zeroing, and `MAPPOTrainer` with clipped PPO + resumable `state_dict`).
-   - Rewrote `marl_training/train.py` (4-stage curriculum CLI, `<out>/metrics.jsonl`, deterministic evaluation + shield-off pass, dual checkpoint export `swarm_policy_best.pt` / `swarm_policy_final.pt` vs. `train_state_latest.pt` / rolling last-3 `train_state_iterNNNNN.pt`, `--resume`, `--init-weights`).
-   - Created `marl_training/eval.py` (headless kinematic evaluator for `clean`, `rain`, `birds`, `clutter`, `target_change` with both `shield=True` and `shield=False`).
+   - Rewrote `marl_training/train.py` (4-stage curriculum CLI, `--shield-off-prob`, `<out>/metrics.jsonl`, deterministic stage-matched evaluation + shield-off pass, dual checkpoint export `swarm_policy_best.pt` / `swarm_policy_final.pt` vs. `train_state_latest.pt` / rolling last-3 `train_state_iterNNNNN.pt`, `--resume`, `--init-weights`).
+   - Created `marl_training/eval.py` (headless kinematic evaluator for `open`, `clean`, `rain`, `birds`, `clutter`, `target_change`, and `--stage <curriculum_stage>` with both `shield=True` and `shield=False`).
    - Added `requirements-colab.txt`, updated `marl_training/requirements.txt` (removed `ray[rllib]`), and created the 9-cell `marl_training/colab_train.ipynb` pointing to `https://github.com/janistall/SEM3_MAINEL_PLSWORK.git`.
-   - Added `src/swarm_control/test/test_mappo_and_steps_2_3.py` (all 24 unit, parity, environment, scenario, QP shield, and MAPPO training/eval tests pass).
+
+9. **Stage 1 MAPPO Training Run, Evaluation-Mismatch Fix, and Verification (`b311940`):**
+   - **Fixed Stage 1 training vs. standalone evaluation mismatch (commit `b311940`):** Added `open` evaluation mode and `--stage` CLI flag to `marl_training/eval.py` (mirroring `train.py` stage-matched evaluation via `DroneSwarmEnv.for_stage`), added a stage-mismatch `UserWarning` when a `stage1_open` checkpoint is evaluated on obstacle modes/stages, updated `marl_training/colab_train.ipynb` Cell 8, and added regression coverage (`test_eval_stage1_open_mode_cli_and_mismatch_warning`).
+   - **Regression test suite:** **All 25 regression tests passed** across `test_contract_v2_parity.py` (10), `test_control.py` (5), `test_env_v2.py` (5), and `test_mappo_and_steps_2_3.py` (5).
+   - **Branch & checkpoint storage:** Commit `b311940` was successfully pushed to `origin/feature/m1-m2-integration`. Training checkpoints (`swarm_policy_*.pt`, `train_state_*.pt`, `metrics.jsonl`) are stored in **Google Drive**, not GitHub.
+   - **Verified Stage 1 (`stage1_open`) MAPPO training & evaluation results (Google Colab T4 GPU):**
+
+     | Metric / Check | Verified Result | Status vs. Gate |
+     |---|---|---|
+     | Training budget | **250 iterations / 600,000 environment steps** (Colab T4 GPU) | Completed |
+     | Best training evaluation (5 episodes) | **100% success** at **iteration 210** | Training peak |
+     | Final training evaluation | **80% success** at **iteration 250** | Late-stage drift |
+     | Independent 20-ep Stage 1 eval (`L+S`, shield enabled) | **70% success**, **92% docking**, **0 collisions** | **Below ≥ 85% Stage 1 gate** |
+     | Independent 20-ep Stage 1 eval (`L`, shield disabled) | **10% success**, **10% docking**, **75% collision rate** | **Shield carrying avoidance** |
+     | Stage 1 acceptance criteria | **NOT met** | Blocked on Stage 1 |
+     | Stage 2 (`stage2_static`) training | **NOT started** | Waiting on Stage 1 gate |
+
+---
+
+## M1 & M2 Implementation Status Audit (Code & Test Evidence)
+
+All statuses below are derived directly from the current codebase on `feature/m1-m2-integration` (`b311940`) and the 25-test regression suite. The frozen integration contract (`swarm-coop-enu-v2`, 62-D observation, 4-D action, tiered shield thresholds, and `swarm_interfaces` messages/services) remains intact and unchanged.
+
+### Completed
+
+| Owner | Component | Code & Test Evidence |
+|---|---|---|
+| **M1** | Contract v2 (`swarm-coop-enu-v2`) & `ActorPolicy` strict `weights_only=True` loader | `src/swarm_control/swarm_control/contract.py` (`Contract`, `apply_contract_metadata`, `validate_action_spec`, `normalize_actor_state_dict`, `make_deploy_payload`, `ActorPolicy`); verified by `test_contract_v2_parity.py` (10 tests). |
+| **M1** | 62-D Observation v2 builder (`k_peer=4`, `k_static=3`, `k_dyn=2`) | `src/swarm_control/swarm_control/observation.py` (`Telemetry.agent_id`, `DynamicObstacle`, `build_observation`); verified by `test_control.py::test_observation_contract_layout` & `test_contract_v2_parity.py`. |
+| **M1** | Upgraded 3-D prioritized-slack QP CBF shield (Step 3) | `src/swarm_control/swarm_control/safety.py` (`ShieldConfig.from_contract`, moving-obstacle `n · v_o` term + `lookahead_tau`, zero-violation fast-path, `_solve_prioritized_slack_qp`, active retreat-on-infeasible fallback); verified by `test_control.py` (3 shield tests), `test_contract_v2_parity.py`, and `test_mappo_and_steps_2_3.py::test_step3_shield_fast_path_qp_and_retreat_fallback`. |
+| **M1** | 10-drone scenario & Gazebo world generator (Step 2) | `src/swarm_control/swarm_control/planning.py` (`±14.8 m` A* bounds), `src/swarm_bringup/swarm_bringup/scenario.py` (`formation_slots`, 10-drone sampling, `±15 m` grid, `>= 4.0 m` zone discs, 10 beacons), regenerated `config/scenario.json` & `worlds/swarm.sdf`; verified by `test_mappo_and_steps_2_3.py::test_step2_10_drone_scenario_and_world_consistency` & `test_env_v2.py::test_scenario_path_loading`. |
+| **M1** | Frozen ROS 2 interface definitions (Phases 7 & 8 schemas) | `src/swarm_interfaces/msg/DynamicObstacle.msg`, `msg/DynamicObstacleArray.msg`, `srv/SetFormation.srv`, registered in `src/swarm_interfaces/CMakeLists.txt`; verified by `test_contract_v2_parity.py::test_frozen_ros2_interface_definitions_exist`. |
+| **M1/M2** | Single-source-of-truth contract re-export | `marl_training/contracts.py` directly re-exports `swarm_control` primitives; verified by `test_contract_v2_parity.py::test_single_source_of_truth_reexports`. |
+| **M2** | 10-drone Contract v2 training env, MAPPO stack, CLI, evaluator, & Colab notebook (Phases 2–4, Step 7) | `marl_training/envs.py`, `models.py`, `mappo.py`, `train.py`, `eval.py` (incl. `open` mode & `--stage` fix in `b311940`), `colab_train.ipynb`, `requirements-colab.txt`; verified by `test_env_v2.py` (5 tests) and `test_mappo_and_steps_2_3.py` (3 MAPPO/eval tests). |
+
+### Partially Completed
+
+| Owner | Phase / Task | What Is Done | What Remains Pending (Code Evidence) |
+|---|---|---|---|
+| **M1** | **Phase 5 — Deployment changes** | `contract.py` (§11.2 metadata & action/peer validation) and `safety.py` (§11.3 `ShieldConfig.from_contract`) are complete and tested. | `src/swarm_control/swarm_control/node.py` (§11.1) and `src/swarm_bringup/launch/swarm.launch.py` (§11.4) are **still 3-drone v1**: `node.py` still always invokes `self.supervisor.step(...)` in `mode:=learned` (no `use_supervisor` bypass), still runs stall recovery using legacy v1 index `observation[20]` (a peer slot in 62-D v2), hardcodes v1 defaults (`speed=0.8`, `accel=1.2`, `±9.3 m` shield workspace instead of `ShieldConfig.from_contract`), does not populate `Telemetry.agent_id`, and lacks `/{drone}/policy_debug` + expanded status JSON. `swarm.launch.py` still hardcodes v1 `speed=0.8`, `accel=1.2`, lacks `use_supervisor`, and defaults to the archived v1 `checkpoints/swarm_macro_policy.pt`. |
+| **M1** | **Phase 6 — Ten drones (ROS 2, Gazebo & Scenario)** | Contract v2, 62-D observation, 3-D QP shield, `planning.py`, `scenario.py`, `config/scenario.json`, and `worlds/swarm.sdf` are all upgraded to 10 drones and `±15 m` arena. | `node.py` still raises `ValueError` unless `len(agent_ids) == 3` and still uses fail-closed `_fresh()` requiring all agents active (no quorum gating). `swarm.launch.py` still raises `ValueError` unless `len(starts) == 3 and len(goals) == 3` (incompatible with the packaged 10-drone `config/scenario.json`) and hardcodes `["drone_0", "drone_1", "drone_2"]`. `swarm_bringup/setup.py` still packages only v1/legacy checkpoints. |
+| **M1/M2** | **Phase 8 — Rain, birds, other obstacles** | `DynamicObstacle` obs/contract slots, moving-obstacle CBF + prioritized-slack QP + retreat fallback (`safety.py`), ROS interface messages (`DynamicObstacle.msg`, `DynamicObstacleArray.msg`), and training/eval simulation support (`envs.py`, `eval.py`) are complete. | ROS 2 `/obstacles/dynamic` subscriber hook in `node.py`, bird publisher node, telemetry noise injection in `src/px4_adapter/px4_adapter/adapter_node.py` (currently unmodified baseline), comms packet-loss/latency fault injector, PX4 wind parameters, and visual rain SDF emitter are not yet implemented. |
+| **M2** | **Step 11 — Stage 1 MAPPO training (`stage1_open`)** | Completed 250 iterations / 600,000 env steps on Colab T4 GPU; fixed Stage 1 evaluation mismatch (`b311940`); checkpoints persisted in Google Drive. | **Acceptance criteria NOT met**: independent 20-ep eval achieved 70% `L+S` success (92% docking, 0 collisions) vs. ≥ 85% gate, and 10% `L` shield-off success (10% docking, 75% collision rate). |
+
+### Pending
+
+- **M2 — Stage 1 convergence & Stage 2–4 curriculum training:** Improve Stage 1 policy until acceptance gate is passed (both shield-ON and shield-OFF), then run **Stage 2 (`stage2_static` — NOT started)**, **Stage 3 (`stage3_dynamic`)**, and **Stage 4 (`stage4_domain_rand`)** on Google Colab and export a passing v2 `swarm_policy_best.pt`.
+- **M1 — `node.py` single-owner integration (Phase 5 → 6 → 7 → 8 hooks) & 10-drone `swarm.launch.py`:** Implement supervisor bypass in `learned` mode, 10-drone support, quorum telemetry gating, `ShieldConfig.from_contract`, `Telemetry.agent_id`, `/{drone}/policy_debug`, `/{drone}/goal` and `/obstacles/dynamic` subscriptions, and 10-drone staggered PX4 launch.
+- **M1/M3 — Phase 7 selectable targets:** `formation_allocator` node, `/swarm/formation_pose`, `/swarm/set_formation` service implementation, and `/{drone}/goal` runtime override.
+- **M1/M3 — Phase 8 ROS/Gazebo environmental & fault injectors:** Comms dropout/latency filter, adapter telemetry noise, PX4 wind config, visual rain SDF, and `/obstacles/dynamic` bird publisher.
+- **M1/M4 — Step 12 SITL integration, ablation matrix & analytics:** End-to-end PX4/Gazebo SITL validation, `L+S` / `L` / `C+S` / `C` / `Z` ablation runs, rosbag2/CSV analytics, and plots.
+
+---
+
+## Next Steps for Improving Stage 1 Performance (Frozen Contract Preserved)
+
+> **Contract constraint:** All Stage 1 improvements below are confined to `marl_training/` training, evaluation, and hyperparameter/reward tuning. **Do not modify** the frozen `swarm-coop-enu-v2` contract (`obs_dim=62`, `k_peer=4`, `k_static=3`, `k_dyn=2`, normalization scales, `±1.5 m/s` & `±0.6 rad/s` action decoding), `ShieldConfig` hard backstops (`0.9 m` / `0.0 m`), or `src/swarm_interfaces/` schemas.
+
+### Root-Cause Diagnosis from Verified Stage 1 Metrics
+1. **Shield dependency (75% collision rate with shield OFF vs. 0% with shield ON):** The CBF shield is absorbing peer-to-peer crossing conflicts during transit, so the actor has not yet learned proactive self-separation on its own.
+2. **Straggler / docking-hold gap (92% per-drone docking vs. 70% full-swarm success with shield ON):** Most drones reach their slots, but 1–2 drones frequently miss the synchronized 10-drone hold window (`success_radius = 0.35 m`, `hold_speed = 0.12 m/s`, `hold_dwell = 10` steps) or get displaced late by nearby peers.
+3. **Training-eval variance and late-stage drift (100% over 5 eps at iter 210 → 80% at iter 250 → 70% over 20 held-out eps):** 5-episode in-training evaluation is too noisy for reliable best-checkpoint selection, and policy updates past iter ~210 drifted slightly on held-out seeds.
+
+### Action Plan Before Advancing to Stage 2
+1. **Inspect Stage 1 diagnostics from Google Drive (`metrics.jsonl`) and per-seed 20-episode rollouts (`seeds 11..30`):**
+   - Check `approx_kl`, `clip_frac`, `entropy`, `value_loss`, `eval_mean_shield_intervention`, `eval_min_pair_distance`, and `eval_final_slot_error` across iterations `1..250` to pinpoint whether instability came from aggressive PPO steps (`approx_kl > 0.03`), entropy collapse, or rising shield intervention.
+   - Separate shield-OFF failures into early/mid-flight crossing collisions vs. late-stage slot-docking collisions, and identify why the final ~8% of drones fail to hold in shield-ON runs.
+2. **Increase unshielded exposure during Stage 1 open-arena training:**
+   - Because Stage 1 has zero static obstacles, increase `--shield-off-prob` progressively (e.g., `0.50 → 0.75` or schedule up to `1.0` after initial goal-reaching converges) so the actor consistently experiences the true consequences of peer crossings instead of leaning on the CBF shield.
+   - Track `eval_shield_off_success_rate` and `eval_shield_off_collision_rate` alongside `eval_mean_shield_intervention` at every evaluation interval.
+3. **Reduce evaluation noise and tighten checkpoint selection:**
+   - Increase `--eval-episodes` from `5` to `10–20` on fixed held-out seeds during Stage 1 runs so `swarm_policy_best.pt` is not selected on a lucky 5-episode sample.
+   - Select or gate Stage 1 promotion using **both** shield-ON (`L+S`) and shield-OFF (`L`) metrics plus low `mean_shield_intervention`.
+4. **Stabilize MAPPO optimization & extend training budget if learning is still improving:**
+   - Keep `approx_kl` controlled (e.g., lower `--lr` to `1.5e-4`–`2e-4`, reduce `--ppo-epochs` from `6` to `4` if `clip_frac > 0.25`, add optional KL early-stopping or value clipping in `mappo.py`, and test larger `--rollout-steps` such as `4800` for lower-variance 10-drone updates).
+   - Verify whether `log_std` is hitting its `-2.0` clamp too early or remaining too noisy during fine slot docking.
+5. **Refine Stage 1 training-only reward shaping (without changing the contract):**
+   - Audit the trade-off between transit progress reward, TTC/soft-spacing penalties (`soft_pair_zone`, closing-speed penalty, per-culprit collision penalty), and final docking/hold incentives so drones smoothly decelerate into `0.35 m` / `0.12 m/s` and proactively yield during peer crossings rather than rushing straight through peers.
+6. **Verify strict Stage 1 gate before starting Stage 2 (`stage2_static`):**
+   - Run independent 20-episode evaluation (`python3 -m marl_training.eval --stage stage1_open --episodes 20 --seeds 11 30`) and confirm **`L+S` ≥ 85% success with 0 collisions and low intervention (< 0.05 m/s)** **and** strong shield-OFF performance (high success, near-zero collisions) before initializing Stage 2 via `--init-weights`.
+   - Re-run all 25 unit/parity/env/MAPPO regression tests before launching any Colab training run.
 
 ---
 
@@ -562,12 +642,12 @@ class CentralizedValueNet(nn.Module):
 
 Instead of scaling agent count (3 → 10), keep **N = 10 from step 1** and ramp environment difficulty:
 
-| Stage | Static obstacles | Dynamic birds | Goal shifts | Domain rand (wind/noise/dropout) | Promotion gate |
-|---|---:|---:|---:|---|---|
-| **Stage 1 (`stage1_open`)** | 0 | 0 | 0% | Off | ≥ 85% eval success, 0 collisions |
-| **Stage 2 (`stage2_static`)** | 3 → 10 | 0 | 0% | Off | ≥ 85% eval success, 0 collisions |
-| **Stage 3 (`stage3_dynamic`)** | 5 → 12 | 1 → 4 | 10% mid-episode | Off | ≥ 80% eval success, 0 collisions |
-| **Stage 4 (`stage4_domain_rand`)** | 3 → 15 | 0 → 4 | 10% mid-episode | Full (wind, noise, 0–30% dropout, latency, lag) | ≥ 85% L+S, ≥ 80% shield-off L |
+| Stage | Static obstacles | Dynamic birds | Goal shifts | Domain rand (wind/noise/dropout) | Promotion gate | Current status |
+|---|---:|---:|---:|---|---|---|
+| **Stage 1 (`stage1_open`)** | 0 | 0 | 0% | Off | ≥ 85% eval success, 0 collisions | **In progress — gate NOT met** (250 iters / 600k steps on Colab T4; best train eval 100% @ iter 210 / 5 eps, final 80% @ iter 250; 20-ep eval: `L+S` 70% success / 92% docking / 0 collisions, `L` 10% success / 10% docking / 75% collision) |
+| **Stage 2 (`stage2_static`)** | 3 → 10 | 0 | 0% | Off | ≥ 85% eval success, 0 collisions | **Not started** (blocked on Stage 1 gate) |
+| **Stage 3 (`stage3_dynamic`)** | 5 → 12 | 1 → 4 | 10% mid-episode | Off | ≥ 80% eval success, 0 collisions | **Not started** |
+| **Stage 4 (`stage4_domain_rand`)** | 3 → 15 | 0 → 4 | 10% mid-episode | Full (wind, noise, 0–30% dropout, latency, lag) | ≥ 85% L+S, ≥ 80% shield-off L | **Not started** |
 
 ### 10.3 Contents
 
@@ -1278,9 +1358,15 @@ plt.tight_layout(); plt.show()
 * ⚠️ **Policy updates too aggressive / noisy:** `approx_kl > 0.05` or `clip_frac > 0.35` → lower `--lr` (`3e-4 → 1.5e-4`) or reduce `--ppo-epochs` (`6 → 4`).
 
 #### Cell 8 — Run Pre-Download Shield-ON vs. Shield-OFF Ablation in Colab
-Before downloading to the ROS 2 laptop, evaluate the best checkpoint across 20 held-out 10-drone seeds (`11..30`) both **with** (`shield=True`) and **without** (`shield=False`) the CBF shield:
+Before downloading to the ROS 2 laptop, evaluate the best checkpoint across 20 held-out 10-drone seeds (`11..30`) both **with** (`shield=True`) and **without** (`shield=False`) the CBF shield. For Stage 1 checkpoints (trained with 0 static obstacles), use `--stage stage1_open` (or `--modes open`) to match the Stage 1 environment (fixed in commit `b311940`; evaluating a `stage1_open` checkpoint on obstacle modes emits a mismatch warning). Training checkpoints remain stored in Google Drive, not GitHub:
 ```bash
 cd /content/uav_EL
+# Stage 1 evaluation (0 static obstacles, matches stage1_open training):
+python3 -m marl_training.eval \
+  --checkpoint /content/drive/MyDrive/uav_swarm_marl/runs/exp01_stage1_open/swarm_policy_best.pt \
+  --num-drones 10 --episodes 20 --seeds 11 30 --stage stage1_open
+
+# Full obstacle/robustness ablation (after Stage 2–4 training):
 python3 -m marl_training.eval \
   --checkpoint /content/drive/MyDrive/uav_swarm_marl/runs/exp04_stage4_domain_rand/swarm_policy_best.pt \
   --num-drones 10 --episodes 20 --seeds 11 30 --modes clean rain birds clutter target_change
@@ -1354,21 +1440,21 @@ PY
 
 ## 18. Work order and effort (Direct-to-10-Drones with MAPPO)
 
-| Step | Work | Effort |
-|---|---|---|
-| 0 | Contract v2 parity test harness (62-D obs, action scale, golden vectors, metadata) | 0.5 day |
-| 1 | Implement Contract v2 (`agents=10`, `k_peer=4`, `k_static=3`, `k_dyn=2`, `obs_dim=62`) in `swarm_control`, unify imports, re-export `marl_training/contracts.py` | 1.5 days |
-| 2 | 10-drone scenario & Gazebo world generator (`scenario.py`: ±15 m arena, ring/grid/V formations, ≥ 4 m discs, regenerated `scenario.json` + `swarm.sdf`) | 2 days |
-| 3 | Upgrade `safety.py`: moving obstacle term (`n · v_o`), pure-NumPy prioritized-slack 3-D QP (with fast-path), prioritized constraints, retreat-on-infeasible fallback, `ShieldConfig.from_contract` | 2 days |
-| 4 | Rewrite `marl_training/envs.py` directly for 10 drones (v2 obs, deployment shield, static + dynamic obstacles, goal randomization + mid-episode shifts, domain randomization flags) | 2.5 days |
-| 5 | Implement pure-PyTorch parameter-shared MAPPO (`models.py` + `mappo.py`: `SwarmActorNet` + `CentralizedValueNet` + GAE rollout buffer + resumable state) | 1.5 days |
-| 6 | Rewrite `train.py` + add `eval.py` (4-stage curriculum, separate clean deploy vs. resumable snapshot export, `--resume`, `--init-weights`, JSONL logging, shield-off eval) | 1.5 days |
-| 7 | Colab package: lightweight `requirements-colab.txt` + `marl_training/colab_train.ipynb` (verified through Cell 4 parity smoke test + short Stage 1 run) | 0.5 day |
-| 8 | ROS 2 deployment updates: `node.py` (supervisor bypass in `learned`, quorum telemetry gating, `/{drone}/policy_debug`), `contract.py` (v2 metadata validation), 10-drone `swarm.launch.py` | 2 days |
-| 9 | Selectable targets: `formation_allocator` node + `/swarm/formation_pose` + `/swarm/set_formation` + `/{drone}/goal` | 1 day |
-| 10 | Environmental & fault injectors: packet-drop/latency comms filter, adapter telemetry noise, PX4 wind params, visual rain SDF, `/obstacles/dynamic` bird publisher | 2 days |
-| 11 | Train & tune 10-drone MAPPO policy on Google Colab (Stages 1 → 4) | 1 – 2 weeks |
-| 12 | Full SITL integration, ablation matrix (`L+S`, `L` shield-off, `C+S`, `C`, `Z`), analytics plots & demo | 3–5 days |
+| Step | Work | Effort | Status |
+|---|---|---|---|
+| 0 | Contract v2 parity test harness (62-D obs, action scale, golden vectors, metadata) | 0.5 day | **Completed** (`test_contract_v2_parity.py`, 10 tests) |
+| 1 | Implement Contract v2 (`agents=10`, `k_peer=4`, `k_static=3`, `k_dyn=2`, `obs_dim=62`) in `swarm_control`, unify imports, re-export `marl_training/contracts.py` | 1.5 days | **Completed** (`contract.py`, `observation.py`, `marl_training/contracts.py`, `swarm_interfaces`) |
+| 2 | 10-drone scenario & Gazebo world generator (`scenario.py`: ±15 m arena, ring/grid/V formations, ≥ 4 m discs, regenerated `scenario.json` + `swarm.sdf`) | 2 days | **Completed** (`planning.py`, `scenario.py`, `scenario.json`, `swarm.sdf`) |
+| 3 | Upgrade `safety.py`: moving obstacle term (`n · v_o`), pure-NumPy prioritized-slack 3-D QP (with fast-path), prioritized constraints, retreat-on-infeasible fallback, `ShieldConfig.from_contract` | 2 days | **Completed** (`safety.py`, verified by shield & QP tests) |
+| 4 | Rewrite `marl_training/envs.py` directly for 10 drones (v2 obs, deployment shield, static + dynamic obstacles, goal randomization + mid-episode shifts, domain randomization flags) | 2.5 days | **Completed** (`envs.py`, `test_env_v2.py`) |
+| 5 | Implement pure-PyTorch parameter-shared MAPPO (`models.py` + `mappo.py`: `SwarmActorNet` + `CentralizedValueNet` + GAE rollout buffer + resumable state) | 1.5 days | **Completed** (`models.py`, `mappo.py`) |
+| 6 | Rewrite `train.py` + add `eval.py` (4-stage curriculum, separate clean deploy vs. resumable snapshot export, `--resume`, `--init-weights`, JSONL logging, shield-off eval) | 1.5 days | **Completed** (`train.py`, `eval.py`, incl. Stage 1 eval mismatch fix `b311940`) |
+| 7 | Colab package: lightweight `requirements-colab.txt` + `marl_training/colab_train.ipynb` (verified through Cell 4 parity smoke test + short Stage 1 run) | 0.5 day | **Completed** (`requirements-colab.txt`, `colab_train.ipynb`, all 25 regression tests pass) |
+| 8 | ROS 2 deployment updates: `node.py` (supervisor bypass in `learned`, quorum telemetry gating, `/{drone}/policy_debug`), `contract.py` (v2 metadata validation), 10-drone `swarm.launch.py` | 2 days | **Partially completed** (`contract.py` done; `node.py` and `swarm.launch.py` still 3-drone v1 — pending) |
+| 9 | Selectable targets: `formation_allocator` node + `/swarm/formation_pose` + `/swarm/set_formation` + `/{drone}/goal` | 1 day | **Partially completed** (`SetFormation.srv` schema frozen; node & hooks pending) |
+| 10 | Environmental & fault injectors: packet-drop/latency comms filter, adapter telemetry noise, PX4 wind params, visual rain SDF, `/obstacles/dynamic` bird publisher | 2 days | **Partially completed** (`DynamicObstacle*.msg` schemas & training-env sim done; ROS/Gazebo/adapter injectors pending) |
+| 11 | Train & tune 10-drone MAPPO policy on Google Colab (Stages 1 → 4) | 1 – 2 weeks | **In progress — Stage 1 gate NOT met** (Stage 1 ran 250 iters / 600k steps on T4; Stage 2 NOT started; checkpoints on Google Drive) |
+| 12 | Full SITL integration, ablation matrix (`L+S`, `L` shield-off, `C+S`, `C`, `Z`), analytics plots & demo | 3–5 days | **Pending** |
 
 ### Suggested team split
 
@@ -1437,4 +1523,4 @@ All open design choices are locked to the most feasible, lowest-risk options so 
 
 ---
 
-*End of document. Nothing in this plan has been implemented yet. Start with Phase 0 and 1 — parity tests and contract unification — before any training run.*
+*End of document. Updated on branch `feature/m1-m2-integration` after commit `b311940` (all 25 regression tests passing). Current priority: satisfy Stage 1 (`stage1_open`) acceptance criteria on Google Colab without modifying the frozen `swarm-coop-enu-v2` contract before starting Stage 2, and complete M1 ROS 2 deployment updates (`node.py`, `swarm.launch.py`).*
