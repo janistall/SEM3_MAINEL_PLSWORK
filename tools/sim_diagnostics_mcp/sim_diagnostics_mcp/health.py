@@ -8,7 +8,7 @@ import shutil
 import sys
 from typing import Any, Callable, Dict, List, Optional
 
-from .config import BridgeConfig
+from .config import BridgeConfig, DEFAULT_GZ_IP
 from .discovery import discover_px4_rootfs_instances
 from .runner import CommandResult, run_readonly_command
 from .validation import validate_timeout
@@ -54,14 +54,21 @@ def check_dependencies(
 
     gz_version: Optional[str] = None
     if executables["gz"]["available"]:
-        gz_ver_res = runner(
-            "gz",
-            ["--version"],
-            timeout_sec=timeout,
-            max_output_bytes=config.max_output_bytes,
-        )
-        if gz_ver_res.ok:
-            gz_version = gz_ver_res.stdout.strip().splitlines()[0] if gz_ver_res.stdout.strip() else None
+        for gz_args in (["sim", "--version"], ["sim", "--versions"], ["--version"]):
+            gz_ver_res = runner(
+                "gz",
+                gz_args,
+                timeout_sec=timeout,
+                max_output_bytes=config.max_output_bytes,
+            )
+            if gz_ver_res.ok:
+                first_line = next(
+                    (line.strip() for line in gz_ver_res.stdout.splitlines() if line.strip()),
+                    None,
+                )
+                if first_line:
+                    gz_version = first_line
+                    break
 
     python_modules = {
         name: module_checker(name)
@@ -72,9 +79,12 @@ def check_dependencies(
     px4_rootfs_instances = discover_px4_rootfs_instances(config.px4_sitl_rootfs_dir)
     workspace_install = config.workspace_dir / "install"
 
+    ros_localhost_only = os.environ.get("ROS_LOCALHOST_ONLY") == "1"
+    ros_domain_id_raw = os.environ.get("ROS_DOMAIN_ID")
+
     env_snapshot = {
         "ROS_DISTRO": os.environ.get("ROS_DISTRO"),
-        "ROS_DOMAIN_ID": os.environ.get("ROS_DOMAIN_ID", "0 (default)"),
+        "ROS_DOMAIN_ID": ros_domain_id_raw if ros_domain_id_raw is not None else "0 (default)",
         "ROS_LOCALHOST_ONLY": os.environ.get("ROS_LOCALHOST_ONLY"),
         "AMENT_PREFIX_PATH": os.environ.get("AMENT_PREFIX_PATH"),
         "GZ_PARTITION": os.environ.get("GZ_PARTITION"),
@@ -88,6 +98,11 @@ def check_dependencies(
         hints.append(
             "SNAP environment detected: run this bridge on the host outside Snap confinement "
             "so ROS 2 Humble, Gazebo Harmonic, and Python 3.10 rclpy are accessible."
+        )
+    if not ros_localhost_only:
+        hints.append(
+            "ROS_LOCALHOST_ONLY is not '1': export ROS_LOCALHOST_ONLY=1 and a dedicated "
+            "ROS_DOMAIN_ID (e.g. 42) in both the MCP bridge and simulation terminals for isolated loopback testing."
         )
     if not executables["ros2"]["available"] or not python_modules["rclpy"]["available"]:
         hints.append("Source ROS 2 Humble on the host: `source /opt/ros/humble/setup.bash`.")
@@ -130,6 +145,13 @@ def check_dependencies(
             "endpoint_url": config.endpoint_url,
             "read_only": True,
             "physical_drone_access": False,
+        },
+        "isolation": {
+            "bridge_loopback_only": config.host == "127.0.0.1",
+            "ros_localhost_only": ros_localhost_only,
+            "ros_domain_id": env_snapshot["ROS_DOMAIN_ID"],
+            "gazebo_ip": env_snapshot["GZ_IP"] or DEFAULT_GZ_IP,
+            "gazebo_partition": env_snapshot["GZ_PARTITION"] or config.default_gz_partition,
         },
         "python": {
             "executable": sys.executable,

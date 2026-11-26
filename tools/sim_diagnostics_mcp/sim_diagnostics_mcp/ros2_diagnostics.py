@@ -505,6 +505,7 @@ def _sample_with_rclpy(
 
                     status_candidates = [
                         f"{ns_prefix}/fmu/out/vehicle_status",
+                        f"{ns_prefix}/fmu/out/vehicle_status_v1",
                         f"{ns_prefix}/fmu/out/vehicle_status_v4",
                     ]
                     for topic in status_candidates:

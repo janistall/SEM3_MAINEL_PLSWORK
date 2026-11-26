@@ -195,7 +195,34 @@ def _zone_radius(points: list) -> float:
     return float(round(max(4.0, max_r + 1.4), 2))
 
 
-def write_world(scenario: Scenario, path: str | Path) -> None:
+def _rain_emitter_model() -> str:
+    """Cosmetic SDF 1.9 rain particle emitter for Gazebo Harmonic (Phase 8 §14.2)."""
+    return (
+        '<model name="rain_volume"><static>true</static><pose>0 0 12 0 3.14159 0</pose>'
+        '<link name="rain_link">'
+        '<particle_emitter name="rain_emitter" type="box">'
+        "<emitting>true</emitting>"
+        "<size>30 30 0.2</size>"
+        "<particle_size>0.02 0.02 0.25</particle_size>"
+        "<lifetime>2.0</lifetime>"
+        "<min_velocity>5.0</min_velocity>"
+        "<max_velocity>7.0</max_velocity>"
+        "<rate>400</rate>"
+        "<scale_rate>0.0</scale_rate>"
+        "<color_start>0.75 0.85 1.0 0.45</color_start>"
+        "<color_end>0.75 0.85 1.0 0.10</color_end>"
+        "</particle_emitter>"
+        "</link></model>"
+    )
+
+
+def write_world(
+    scenario: Scenario,
+    path: str | Path,
+    *,
+    wind: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    rain: bool = False,
+) -> None:
     parts = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<sdf version="1.9"><world name="swarm">',
@@ -213,9 +240,9 @@ def write_world(scenario: Scenario, path: str | Path) -> None:
         "<elevation>488</elevation>"
         "</spherical_coordinates>",
         '<scene><grid>false</grid><ambient>0.4 0.4 0.4 1</ambient>'
-        "<background>0.7 0.7 0.7 1</background><shadows>true</shadows></scene>",
+        "<background>0.7 0.7 0.7 1</background><shadows>false</shadows></scene>",
         '<light name="sun" type="directional"><pose>0 0 500 0 -0 0</pose>'
-        "<cast_shadows>true</cast_shadows><intensity>1</intensity>"
+        "<cast_shadows>false</cast_shadows><intensity>1</intensity>"
         "<direction>0.001 0.625 -0.78</direction>"
         "<diffuse>0.904 0.904 0.904 1</diffuse>"
         "<specular>0.271 0.271 0.271 1</specular>"
@@ -233,17 +260,32 @@ def write_world(scenario: Scenario, path: str | Path) -> None:
         + "</link></model>",
     ]
 
+    wx, wy, wz = (float(wind[0]), float(wind[1]), float(wind[2]))
+    if any(abs(component) > 1e-9 for component in (wx, wy, wz)):
+        parts.append(f"<wind><linear_velocity>{wx} {wy} {wz}</linear_velocity></wind>")
+    if rain:
+        parts.append(_rain_emitter_model())
+
     grid_half = 15
     grid_span = 2 * grid_half
+    grid_visuals: list[str] = []
     for k in range(-grid_half, grid_half + 1):
         for axis in range(2):
             size = f"0.015 {grid_span} 0.002" if axis == 0 else f"{grid_span} 0.015 0.002"
             pose = f"{k if axis == 0 else 0} {k if axis == 1 else 0} .002 0 0 0"
-            parts.append(
-                f'<model name="grid_{axis}_{k + grid_half}"><static>true</static><link name="line">'
-                + _visual("line", f"<box><size>{size}</size></box>", "0.25 0.29 0.34 1", pose)
-                + "</link></model>"
+            grid_visuals.append(
+                _visual(
+                    f"line_{axis}_{k + grid_half}",
+                    f"<box><size>{size}</size></box>",
+                    "0.25 0.29 0.34 1",
+                    pose,
+                )
             )
+    parts.append(
+        '<model name="arena_grid"><static>true</static><link name="lines">'
+        + "".join(grid_visuals)
+        + "</link></model>"
+    )
 
     start_x = float(np.mean([start[0] for start in scenario.starts]))
     start_y = float(np.mean([start[1] for start in scenario.starts]))
@@ -284,6 +326,19 @@ def main() -> None:
     parser.add_argument("--drones", type=int, default=10)
     parser.add_argument("--shape", default="ring", choices=("ring", "grid", "v", "triangle"))
     parser.add_argument("--spacing", type=float, default=1.6)
+    parser.add_argument(
+        "--wind",
+        type=float,
+        nargs=3,
+        default=(0.0, 0.0, 0.0),
+        metavar=("WX", "WY", "WZ"),
+        help="Optional Gazebo world linear wind velocity in ENU (m/s).",
+    )
+    parser.add_argument(
+        "--rain",
+        action="store_true",
+        help="Add a cosmetic Gazebo Harmonic rain particle emitter to swarm.sdf.",
+    )
     parser.add_argument("--out", default="generated")
     args = parser.parse_args()
     folder = Path(args.out)
@@ -296,7 +351,12 @@ def main() -> None:
         spacing=args.spacing,
     )
     scenario.save(folder / "scenario.json")
-    write_world(scenario, folder / "swarm.sdf")
+    write_world(
+        scenario,
+        folder / "swarm.sdf",
+        wind=(float(args.wind[0]), float(args.wind[1]), float(args.wind[2])),
+        rain=bool(args.rain),
+    )
     print(folder.resolve())
 
 

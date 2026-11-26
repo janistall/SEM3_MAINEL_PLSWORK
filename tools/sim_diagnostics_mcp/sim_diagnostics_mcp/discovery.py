@@ -146,6 +146,7 @@ def discover_from_ros_graph(
                 ),
                 "has_vehicle_status": any(
                     t.endswith("/fmu/out/vehicle_status")
+                    or t.endswith("/fmu/out/vehicle_status_v1")
                     or t.endswith("/fmu/out/vehicle_status_v4")
                     for t in item["out_topics"]
                 ),

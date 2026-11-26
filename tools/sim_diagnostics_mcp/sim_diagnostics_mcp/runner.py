@@ -28,8 +28,13 @@ _ROS2_ALLOWED_PREFIXES: Tuple[Tuple[str, ...], ...] = (
     ("doctor", "--report"),
 )
 
-_GZ_ALLOWED_PREFIXES: Tuple[Tuple[str, ...], ...] = (
+_GZ_EXACT_ALLOWED: Tuple[Tuple[str, ...], ...] = (
     ("--version",),
+    ("sim", "--version"),
+    ("sim", "--versions"),
+)
+
+_GZ_ALLOWED_PREFIXES: Tuple[Tuple[str, ...], ...] = (
     ("topic", "-l"),
     ("topic", "-i"),
     ("topic", "-e"),
@@ -72,7 +77,9 @@ def _verify_allowlisted_command(executable: str, args: Sequence[str]) -> None:
             raise ValidationError("Mutating ROS 2 arguments are prohibited in read-only mode.")
 
     elif executable == "gz":
-        if not any(arg_tuple[: len(prefix)] == prefix for prefix in _GZ_ALLOWED_PREFIXES):
+        if arg_tuple not in _GZ_EXACT_ALLOWED and not any(
+            arg_tuple[: len(prefix)] == prefix for prefix in _GZ_ALLOWED_PREFIXES
+        ):
             raise ValidationError(
                 f"Disallowed gz subcommand {list(arg_tuple[:2])!r}; only read-only topic/model/version inspection is permitted."
             )

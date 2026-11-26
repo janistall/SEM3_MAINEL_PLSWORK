@@ -138,6 +138,9 @@ class TestConfigAndValidation(unittest.TestCase):
         # Allowed read-only commands pass verification
         _verify_allowlisted_command("ros2", ["topic", "list", "-t"])
         _verify_allowlisted_command("ros2", ["topic", "echo", "/drone_0/status", "--once"])
+        _verify_allowlisted_command("gz", ["sim", "--version"])
+        _verify_allowlisted_command("gz", ["sim", "--versions"])
+        _verify_allowlisted_command("gz", ["--version"])
         _verify_allowlisted_command("gz", ["topic", "-e", "-n", "1", "-t", "/world/swarm/stats"])
         _verify_allowlisted_command("ps", ["-eo", "pid,ppid,stat,pcpu,pmem,etime,args", "--no-headers"])
 
@@ -150,6 +153,8 @@ class TestConfigAndValidation(unittest.TestCase):
             ("ros2", ["param", "set", "/control_0", "mode", "zero"]),
             ("ros2", ["launch", "swarm_bringup", "swarm.launch.py"]),
             ("gz", ["sim", "-r", "-s", "swarm.sdf"]),
+            ("gz", ["sim", "-g"]),
+            ("gz", ["sim", "--version", "-r"]),
             ("gz", ["service", "-s", "/world/swarm/control"]),
             ("gz", ["topic", "-p", "-t", "/cmd"]),
             ("ps", ["aux"]),
@@ -556,18 +561,73 @@ class TestHealthAndServerWiring(unittest.TestCase):
             sitl_bin.write_text("", encoding="utf-8")
             cfg = BridgeConfig(px4_dir=px4_dir, workspace_dir=Path(tmp) / "ws", ros_log_dir=Path(tmp) / "roslog")
 
-            report = check_dependencies(
-                cfg,
-                which_fn=lambda name: f"/usr/bin/{name}",
-                module_checker=lambda name: {"available": True, "version": "1.0"},
-                runner=lambda exe, args, **kw: _ok_result(exe, args, "Gazebo Sim, version 8.15.0\n"),
-            )
+            recorded_gz_calls: List[List[str]] = []
+
+            def fake_gz_runner(exe: str, args: List[str], **kw: Any) -> CommandResult:
+                recorded_gz_calls.append(list(args))
+                if args == ["sim", "--version"]:
+                    return _ok_result(exe, args, "Gazebo Sim, version 8.15.0\n")
+                return _err_result(exe, args, error="unsupported flag")
+
+            prev_lo = os.environ.get("ROS_LOCALHOST_ONLY")
+            prev_dom = os.environ.get("ROS_DOMAIN_ID")
+            prev_snap = os.environ.get("SNAP")
+            os.environ["ROS_LOCALHOST_ONLY"] = "1"
+            os.environ["ROS_DOMAIN_ID"] = "42"
+            os.environ.pop("SNAP", None)
+            try:
+                report = check_dependencies(
+                    cfg,
+                    which_fn=lambda name: f"/usr/bin/{name}",
+                    module_checker=lambda name: {"available": True, "version": "1.0"},
+                    runner=fake_gz_runner,
+                )
+            finally:
+                if prev_lo is None:
+                    os.environ.pop("ROS_LOCALHOST_ONLY", None)
+                else:
+                    os.environ["ROS_LOCALHOST_ONLY"] = prev_lo
+                if prev_dom is None:
+                    os.environ.pop("ROS_DOMAIN_ID", None)
+                else:
+                    os.environ["ROS_DOMAIN_ID"] = prev_dom
+                if prev_snap is not None:
+                    os.environ["SNAP"] = prev_snap
+
+            self.assertEqual(recorded_gz_calls, [["sim", "--version"]])
             self.assertTrue(report["ok"])
             self.assertTrue(report["ready_for_live_diagnostics"])
             self.assertEqual(report["gazebo_version"], "Gazebo Sim, version 8.15.0")
             self.assertEqual(report["bridge"]["endpoint_url"], "http://127.0.0.1:8765/mcp")
             self.assertTrue(report["bridge"]["read_only"])
             self.assertFalse(report["bridge"]["physical_drone_access"])
+            self.assertTrue(report["isolation"]["ros_localhost_only"])
+            self.assertEqual(report["isolation"]["ros_domain_id"], "42")
+            self.assertEqual(report["remediation_hints"], [])
+
+            # Fallback to `gz sim --versions` when `gz sim --version` fails, and warn when unisolated
+            os.environ["ROS_LOCALHOST_ONLY"] = "0"
+            try:
+                fallback_report = check_dependencies(
+                    cfg,
+                    which_fn=lambda name: f"/usr/bin/{name}",
+                    module_checker=lambda name: {"available": True, "version": "1.0"},
+                    runner=lambda exe, args, **kw: (
+                        _ok_result(exe, args, "8.15.0\n")
+                        if args == ["sim", "--versions"]
+                        else _err_result(exe, args, error="unknown")
+                    ),
+                )
+            finally:
+                if prev_lo is None:
+                    os.environ.pop("ROS_LOCALHOST_ONLY", None)
+                else:
+                    os.environ["ROS_LOCALHOST_ONLY"] = prev_lo
+            self.assertEqual(fallback_report["gazebo_version"], "8.15.0")
+            self.assertFalse(fallback_report["isolation"]["ros_localhost_only"])
+            self.assertTrue(
+                any("ROS_LOCALHOST_ONLY" in hint for hint in fallback_report["remediation_hints"])
+            )
 
     def test_create_server_registers_only_readonly_tools_on_strict_loopback(self) -> None:
         class FakeSettings:

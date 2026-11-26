@@ -46,4 +46,10 @@ fi
 export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export SWARM_WORKSPACE_DIR="${WORKSPACE_DIR}"
 
+# Default to isolated loopback-only ROS 2 and Gazebo transport for software-only SITL.
+export ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-1}"
+export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
+export GZ_IP="${GZ_IP:-127.0.0.1}"
+export GZ_PARTITION="${GZ_PARTITION:-swarm}"
+
 exec "${PYTHON_BIN}" -m sim_diagnostics_mcp "$@"

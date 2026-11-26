@@ -1,24 +1,21 @@
 from __future__ import annotations
 
 import json
-import math
 import time
 from pathlib import Path
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import Twist
-from rclpy.node import Node
+from geometry_msgs.msg import PoseStamped, Twist
 from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from std_msgs.msg import String
-from swarm_interfaces.msg import AgentTelemetry
+from std_msgs.msg import Float32MultiArray, String
+from swarm_interfaces.msg import AgentTelemetry, DynamicObstacleArray
 
-from .contract import ActorPolicy, Contract, DEFAULT_CONTRACT, action_to_velocity
-from .observation import Obstacle, Telemetry, build_observation
-from .planning import ClassicalMacro
-from .safety import ShieldConfig, safe_velocity
-from .supervisor import Mode, Supervisor, SupervisorConfig
+from .contract import DEFAULT_CONTRACT
+from .controller_core import ControllerConfig, SwarmControllerCore
+from .observation import DynamicObstacle, Obstacle
 
 
 def _stamp_seconds(stamp) -> float:
@@ -29,11 +26,13 @@ class SwarmControlNode(Node):
     def __init__(self):
         super().__init__("swarm_control")
 
+        default_agents = [f"drone_{i}" for i in range(DEFAULT_CONTRACT.agents)]
+
         self.declare_parameter("drone_id", "drone_0")
         self.declare_parameter("agent_index", 0)
-        self.declare_parameter("agent_ids", ["drone_0", "drone_1", "drone_2"])
-        self.declare_parameter("slot", [0.0, 0.0, 2.5])
-        self.declare_parameter("start", [0.0, 0.0, 0.1])
+        self.declare_parameter("agent_ids", default_agents)
+        self.declare_parameter("slot", [0.0, 0.0, DEFAULT_CONTRACT.alt])
+        self.declare_parameter("start", [0.0, 0.0, 0.45])
         self.declare_parameter("scenario", "")
         self.declare_parameter("mode", "learned")
         self.declare_parameter("checkpoint", "")
@@ -41,112 +40,85 @@ class SwarmControlNode(Node):
         self.declare_parameter("actor_index", 0)
         self.declare_parameter("control_rate", 10.0)
         self.declare_parameter("enable_shield", True)
-        self.declare_parameter("altitude", 2.5)
-        self.declare_parameter("speed", 0.8)
-        self.declare_parameter("accel", 1.2)
-        self.declare_parameter("yaw_rate", 0.6)
+        self.declare_parameter("use_supervisor", False)
+        self.declare_parameter("quorum_min_peers", 3)
+        self.declare_parameter("altitude", DEFAULT_CONTRACT.alt)
+        self.declare_parameter("speed", DEFAULT_CONTRACT.speed)
+        self.declare_parameter("accel", DEFAULT_CONTRACT.accel)
+        self.declare_parameter("yaw_rate", DEFAULT_CONTRACT.yaw_rate)
         self.declare_parameter("docking_timeout", 15.0)
         self.declare_parameter("hold_dwell", 1.5)
         self.declare_parameter("telemetry_timeout", 0.5)
+        self.declare_parameter("dynamic_obstacle_timeout", 1.0)
+        self.declare_parameter("shield_lookahead_tau", 0.0)
         self.declare_parameter("stall_recovery", True)
         self.declare_parameter("stall_time", 1.0)
         self.declare_parameter("stall_recover_time", 1.5)
         self.declare_parameter("stall_clearance", 0.6)
 
-        self.drone_id = self.get_parameter("drone_id").value
-        self.agent_index = int(self.get_parameter("agent_index").value)
-        self.agent_ids = list(self.get_parameter("agent_ids").value)
-        self.slot = np.asarray(self.get_parameter("slot").value, dtype=np.float64)
-        self.start = np.asarray(self.get_parameter("start").value, dtype=np.float64)
         self.scenario_path = str(self.get_parameter("scenario").value)
-        self.mode_name = str(self.get_parameter("mode").value)
-        self.checkpoint = str(self.get_parameter("checkpoint").value)
-        self.allow_legacy = bool(self.get_parameter("allow_legacy_checkpoint").value)
-        self.actor_index = int(self.get_parameter("actor_index").value)
-        self.control_rate = float(self.get_parameter("control_rate").value)
-        self.enable_shield = bool(self.get_parameter("enable_shield").value)
-        self.altitude = float(self.get_parameter("altitude").value)
-        self.speed = float(self.get_parameter("speed").value)
-        self.accel = float(self.get_parameter("accel").value)
-        self.yaw_rate_max = float(self.get_parameter("yaw_rate").value)
-        self.telemetry_timeout = float(self.get_parameter("telemetry_timeout").value)
-        self.stall_recovery = bool(self.get_parameter("stall_recovery").value)
-        self.stall_time = float(self.get_parameter("stall_time").value)
-        self.stall_recover_time = float(self.get_parameter("stall_recover_time").value)
-        self.stall_clearance = float(self.get_parameter("stall_clearance").value)
+        obstacles = self._load_obstacles()
 
-        if len(self.agent_ids) != 3:
-            raise ValueError("this build requires exactly three agents")
-        if not 0 <= self.agent_index < 3:
-            raise ValueError("agent_index must be 0, 1 or 2")
-        if self.drone_id != self.agent_ids[self.agent_index]:
-            raise ValueError("drone_id must equal agent_ids[agent_index]")
-        if self.slot.shape != (3,) or self.start.shape != (3,):
-            raise ValueError("slot and start must each have three values")
-
-        self.contract = Contract(
-            speed=self.speed,
-            accel=self.accel,
-            yaw_rate=self.yaw_rate_max,
-            alt=self.altitude,
-        )
-        self.obstacles = self._load_obstacles()
-        self.policy = None
-        self.classical = None
-        if self.mode_name == "learned":
-            if not self.checkpoint:
-                raise RuntimeError(
-                    "mode:=learned requires checkpoint:=/path/to/actor.pt. "
-                    "The original maddpg_iter00460.pt is not present in this workspace."
-                )
-            self.policy = ActorPolicy(
-                self.checkpoint,
-                contract=self.contract,
-                actor_index=self.actor_index,
-                allow_legacy=self.allow_legacy,
-            )
-            self.get_logger().info(
-                f"loaded actor {self.actor_index} from {self.checkpoint} "
-                f"(schema={self.contract.schema})"
-            )
-        elif self.mode_name == "classical":
-            self.classical = ClassicalMacro(
-                self.start,
-                self.slot,
-                self.obstacles,
-                speed=self.speed,
-                altitude=self.altitude,
-            )
-        elif self.mode_name != "zero":
-            raise ValueError("mode must be learned, classical or zero")
-
-        self.supervisor = Supervisor(
-            SupervisorConfig(
-                brake_accel=0.8,
-                docking_timeout=float(self.get_parameter("docking_timeout").value),
-                hold_dwell=float(self.get_parameter("hold_dwell").value),
-            )
-        )
-        self.shield = ShieldConfig(
-            speed=self.speed,
-            accel=self.accel,
-            workspace=(
-                (-9.3, 9.3),
-                (-9.3, 9.3),
-                (0.35, max(4.0, self.altitude + 1.0)),
+        cfg = ControllerConfig(
+            drone_id=str(self.get_parameter("drone_id").value),
+            agent_index=int(self.get_parameter("agent_index").value),
+            agent_ids=list(self.get_parameter("agent_ids").value),
+            slot=list(self.get_parameter("slot").value),
+            start=list(self.get_parameter("start").value),
+            mode=str(self.get_parameter("mode").value),
+            checkpoint=str(self.get_parameter("checkpoint").value),
+            allow_legacy_checkpoint=bool(self.get_parameter("allow_legacy_checkpoint").value),
+            actor_index=int(self.get_parameter("actor_index").value),
+            control_rate=float(self.get_parameter("control_rate").value),
+            enable_shield=bool(self.get_parameter("enable_shield").value),
+            use_supervisor=bool(self.get_parameter("use_supervisor").value),
+            quorum_min_peers=int(self.get_parameter("quorum_min_peers").value),
+            altitude=float(self.get_parameter("altitude").value),
+            speed=float(self.get_parameter("speed").value),
+            accel=float(self.get_parameter("accel").value),
+            yaw_rate=float(self.get_parameter("yaw_rate").value),
+            docking_timeout=float(self.get_parameter("docking_timeout").value),
+            hold_dwell=float(self.get_parameter("hold_dwell").value),
+            telemetry_timeout=float(self.get_parameter("telemetry_timeout").value),
+            dynamic_obstacle_timeout=float(
+                self.get_parameter("dynamic_obstacle_timeout").value
             ),
+            shield_lookahead_tau=float(self.get_parameter("shield_lookahead_tau").value),
+            stall_recovery=bool(self.get_parameter("stall_recovery").value),
+            stall_time=float(self.get_parameter("stall_time").value),
+            stall_recover_time=float(self.get_parameter("stall_recover_time").value),
+            stall_clearance=float(self.get_parameter("stall_clearance").value),
         )
+
+        self.core = SwarmControllerCore(cfg, obstacles=obstacles)
+        self.drone_id = self.core.drone_id
+        self.agent_index = self.core.agent_index
+        self.agent_ids = self.core.agent_ids
+        self.contract = self.core.contract
+
+        if self.core.supervisor_override_warning:
+            self.get_logger().warn(self.core.supervisor_override_warning)
+        if self.core.mode_name == "learned":
+            self.get_logger().info(
+                f"loaded actor {self.core.actor_index} from {self.core.checkpoint} "
+                f"(schema={self.contract.schema}, obs_dim={self.contract.obs_dim}, "
+                f"speed={self.contract.speed}, accel={self.contract.accel}, "
+                f"yaw_rate={self.contract.yaw_rate})"
+            )
 
         telemetry_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
-            depth=10,
+            depth=1,
         )
-        self.telemetry: dict[str, Telemetry] = {
-            agent_id: Telemetry.zero() for agent_id in self.agent_ids
-        }
-        self.last_rx: dict[str, float] = {agent_id: 0.0 for agent_id in self.agent_ids}
+        goal_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+
         self.telemetry_subs = []
         for agent_id in self.agent_ids:
             self.telemetry_subs.append(
@@ -158,47 +130,85 @@ class SwarmControlNode(Node):
                 )
             )
 
+        self.goal_sub = self.create_subscription(
+            PoseStamped,
+            f"/{self.drone_id}/goal",
+            self._on_goal,
+            goal_qos,
+        )
+        self.dynamic_obs_sub = self.create_subscription(
+            DynamicObstacleArray,
+            "/obstacles/dynamic",
+            self._on_dynamic_obstacles,
+            telemetry_qos,
+        )
+
         self.cmd_pub = self.create_publisher(Twist, f"/{self.drone_id}/cmd_vel", 10)
         self.status_pub = self.create_publisher(String, f"/{self.drone_id}/status", 10)
-        self.dt = 1.0 / self.control_rate
+        self.debug_pub = self.create_publisher(
+            Float32MultiArray, f"/{self.drone_id}/policy_debug", 10
+        )
+        self._cmd_msg = Twist()
+        self._debug_msg = Float32MultiArray()
+        self._status_msg = String()
+
+        self.dt = self.core.dt
         self.last_log = 0.0
-        self.stall_timer = 0.0
-        self.recover_timer = 0.0
         self.timer = self.create_timer(self.dt, self.tick)
         self.get_logger().info(
-            f"{self.drone_id} index={self.agent_index} mode={self.mode_name} "
-            f"slot={self.slot.tolist()} shield={self.enable_shield}"
+            f"{self.drone_id} index={self.agent_index}/{len(self.agent_ids)} "
+            f"mode={self.core.mode_name} supervisor={self.core.use_supervisor} "
+            f"quorum_min_peers={self.core.quorum_min_peers} "
+            f"slot={self.core.slot.tolist()} shield={self.core.enable_shield}"
         )
 
     def _load_obstacles(self) -> list[Obstacle]:
         if not self.scenario_path:
             return []
-        payload = json.loads(Path(self.scenario_path).read_text())
+        payload = json.loads(Path(self.scenario_path).read_text(encoding="utf-8"))
         return [
             Obstacle(float(x), float(y), float(radius), float(height))
             for x, y, radius, height in payload.get("obstacles", [])
         ]
 
     def _on_telemetry(self, agent_id: str, msg: AgentTelemetry) -> None:
-        position = np.array([msg.position.x, msg.position.y, msg.position.z], dtype=np.float64)
-        velocity = np.array([msg.velocity.x, msg.velocity.y, msg.velocity.z], dtype=np.float64)
-        stamp = _stamp_seconds(msg.header.stamp)
-        self.telemetry[agent_id] = Telemetry(
-            position, velocity, float(msg.yaw), stamp, bool(msg.active_status)
+        self.core.update_telemetry(
+            agent_id=agent_id,
+            position=(msg.position.x, msg.position.y, msg.position.z),
+            velocity=(msg.velocity.x, msg.velocity.y, msg.velocity.z),
+            yaw=float(msg.yaw),
+            stamp=_stamp_seconds(msg.header.stamp),
+            active=bool(msg.active_status),
+            now=time.monotonic(),
         )
-        self.last_rx[agent_id] = time.monotonic()
 
-    def _fresh(self) -> bool:
-        now = time.monotonic()
-        return all(
-            self.telemetry[agent_id].active
-            and self.last_rx[agent_id] > 0.0
-            and now - self.last_rx[agent_id] <= self.telemetry_timeout
-            for agent_id in self.agent_ids
+    def _on_goal(self, msg: PoseStamped) -> None:
+        accepted, reason = self.core.update_goal(
+            (msg.pose.position.x, msg.pose.position.y, msg.pose.position.z)
         )
+        if accepted:
+            self.get_logger().info(f"{self.drone_id}: {reason}")
+        else:
+            self.get_logger().warn(f"{self.drone_id}: rejected /{self.drone_id}/goal — {reason}")
+
+    def _on_dynamic_obstacles(self, msg: DynamicObstacleArray) -> None:
+        obstacles = [
+            DynamicObstacle(
+                position=np.array(
+                    [obs.position.x, obs.position.y, obs.position.z], dtype=np.float64
+                ),
+                velocity=np.array(
+                    [obs.velocity.x, obs.velocity.y, obs.velocity.z], dtype=np.float64
+                ),
+                radius=float(obs.radius),
+                active=bool(obs.active),
+            )
+            for obs in msg.obstacles
+        ]
+        self.core.update_dynamic_obstacles(obstacles, now=time.monotonic())
 
     def _publish(self, velocity: np.ndarray, yaw_rate: float) -> None:
-        command = Twist()
+        command = self._cmd_msg
         command.linear.x = float(velocity[0])
         command.linear.y = float(velocity[1])
         command.linear.z = float(velocity[2])
@@ -206,129 +216,22 @@ class SwarmControlNode(Node):
         self.cmd_pub.publish(command)
 
     def tick(self) -> None:
-        if not self._fresh():
-            self._publish(np.zeros(3), 0.0)
+        now = time.monotonic()
+        output = self.core.step(now)
+        self._publish(output.velocity, output.yaw_rate)
+
+        if not output.quorum_ok:
             return
 
-        own = self.telemetry[self.drone_id]
-        peers = [
-            self.telemetry[agent_id]
-            for agent_id in self.agent_ids
-            if agent_id != self.drone_id
-        ]
-        observation = build_observation(
-            self.agent_index,
-            [self.telemetry[agent_id] for agent_id in self.agent_ids],
-            self.slot,
-            self.obstacles,
-            self.contract,
-        )
+        if output.debug_vector is not None:
+            self._debug_msg.data = [float(x) for x in output.debug_vector.tolist()]
+            self.debug_pub.publish(self._debug_msg)
 
-        if self.policy is not None:
-            action = self.policy(observation)
-            macro_velocity, macro_yaw_rate = action_to_velocity(action, self.contract)
-        elif self.classical is not None:
-            macro_velocity = self.classical(own.position, own.velocity, peers, self.dt)
-            macro_yaw_rate = 0.0
-        else:
-            macro_velocity = np.zeros(3)
-            macro_yaw_rate = 0.0
-
-        desired, stop_distance = self.supervisor.step(
-            own.position, own.velocity, self.slot, macro_velocity, self.dt
-        )
-
-        stall_active = False
-        if (
-            self.stall_recovery
-            and self.supervisor.mode == Mode.APPROACH
-            and self.obstacles
-            and own.position[2] > self.altitude - 0.25
-        ):
-            distance = float(np.linalg.norm(self.slot - own.position))
-            speed = float(np.linalg.norm(own.velocity[:2]))
-            clearance = float(observation[20]) * self.contract.obstacle_scale
-            if distance > 1.0 and speed < 0.05 and clearance < self.stall_clearance:
-                self.stall_timer += self.dt
-            else:
-                self.stall_timer = max(0.0, self.stall_timer - self.dt)
-            if self.stall_timer >= self.stall_time:
-                self.recover_timer = self.stall_recover_time
-                self.stall_timer = 0.0
-            if self.recover_timer > 0.0:
-                nearest = min(
-                    self.obstacles,
-                    key=lambda o: float(
-                        np.linalg.norm(own.position[:2] - np.array([o.x, o.y]))
-                    )
-                    - o.radius,
-                )
-                delta = own.position[:2] - np.array([nearest.x, nearest.y])
-                length = float(np.linalg.norm(delta))
-                if length < 1e-9:
-                    delta = np.array([1.0, 0.0])
-                    length = 1.0
-                desired = np.array(
-                    [
-                        delta[0] / length * self.speed,
-                        delta[1] / length * self.speed,
-                        float(
-                            np.clip(
-                                1.1 * (self.altitude - own.position[2]),
-                                -self.speed,
-                                self.speed,
-                            )
-                        ),
-                    ]
-                )
-                self.recover_timer = max(0.0, self.recover_timer - self.dt)
-                stall_active = True
-
-        yaw_rate = (
-            0.0
-            if stall_active or self.supervisor.mode in (Mode.DOCKING, Mode.HOLD)
-            else float(np.clip(macro_yaw_rate, -self.yaw_rate_max, self.yaw_rate_max))
-        )
-
-        if self.enable_shield:
-            result = safe_velocity(
-                own.position,
-                own.velocity,
-                desired,
-                peers,
-                self.obstacles,
-                self.dt,
-                self.shield,
-            )
-            velocity, feasible, intervention = result.velocity, result.feasible, result.intervention
-        else:
-            low = np.maximum(-self.speed, own.velocity - self.accel * self.dt)
-            high = np.minimum(self.speed, own.velocity + self.accel * self.dt)
-            low, high = np.minimum(low, high), np.maximum(low, high)
-            velocity = np.minimum(np.maximum(desired, low), high)
-            feasible, intervention = True, 0.0
-
-        self._publish(velocity, yaw_rate)
-
-        now = time.monotonic()
-        if now - self.last_log >= 1.0:
+        if output.status_dict is not None and now - self.last_log >= 1.0:
             self.last_log = now
-            distance = float(np.linalg.norm(self.slot - own.position))
-            status = {
-                "drone_id": self.drone_id,
-                "mode": self.supervisor.mode.value,
-                "position": own.position.round(3).tolist(),
-                "velocity": own.velocity.round(3).tolist(),
-                "goal_distance": round(distance, 3),
-                "d_stop": round(stop_distance, 3),
-                "shield_feasible": bool(feasible),
-                "shield_intervention": round(float(intervention), 4),
-                "stall_recovery": bool(stall_active),
-            }
-            message = String()
-            message.data = json.dumps(status)
-            self.status_pub.publish(message)
-            self.get_logger().info(message.data)
+            self._status_msg.data = json.dumps(output.status_dict)
+            self.status_pub.publish(self._status_msg)
+            self.get_logger().info(self._status_msg.data)
 
 
 def main(args=None):
