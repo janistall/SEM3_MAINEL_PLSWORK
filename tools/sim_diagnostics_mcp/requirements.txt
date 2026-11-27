@@ -1,0 +1,2 @@
+# Official Model Context Protocol Python SDK (Streamable HTTP + FastMCP, Python 3.10 compatible)
+mcp>=1.9.0,<2.0.0

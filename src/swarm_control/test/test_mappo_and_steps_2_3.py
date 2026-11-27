@@ -5,6 +5,7 @@ import json
 import sys
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -19,7 +20,12 @@ if str(_BRINGUP_SRC) not in sys.path:
 
 from marl_training.contracts import ActorPolicy, DEFAULT_CONTRACT
 from marl_training.envs import DroneSwarmEnv
-from marl_training.eval import evaluate_policy
+from marl_training.eval import (
+    EVAL_MODES,
+    _make_env_for_mode,
+    evaluate_policy,
+    main as eval_main,
+)
 from marl_training.mappo import MAPPOTrainer, RolloutBuffer
 from marl_training.models import CentralizedValueNet, SwarmActorNet
 from marl_training.train import build_arg_parser, run_training, save_deploy_pt
@@ -232,6 +238,127 @@ class TestSteps2And3AndPhases3And4(unittest.TestCase):
             )
             self.assertIn("success_rate", eval_res)
             self.assertIn("mean_shield_intervention", eval_res)
+
+    def test_eval_stage1_open_mode_cli_and_mismatch_warning(self):
+        self.assertIn("open", EVAL_MODES)
+        open_env = _make_env_for_mode(
+            "open",
+            num_drones=10,
+            max_steps=20,
+            shield=True,
+            scenario_path=None,
+            contract=DEFAULT_CONTRACT,
+        )
+        self.assertEqual(open_env.num_static_range, (0, 0))
+        self.assertEqual(open_env.num_dyn_range, (0, 0))
+        open_env.reset(seed=11)
+        self.assertEqual(len(open_env.obstacles), 0)
+        self.assertEqual(len(open_env.dyn_obstacles), 0)
+
+        trainer = MAPPOTrainer(contract=DEFAULT_CONTRACT)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stage1_ckpt = Path(tmpdir) / "stage1_best.pt"
+            stage2_ckpt = Path(tmpdir) / "stage2_best.pt"
+            save_deploy_pt(
+                trainer,
+                DEFAULT_CONTRACT,
+                stage1_ckpt,
+                steps=2400,
+                seed=7,
+                stage="stage1_open",
+                note="stage1 test",
+            )
+            save_deploy_pt(
+                trainer,
+                DEFAULT_CONTRACT,
+                stage2_ckpt,
+                steps=4800,
+                seed=7,
+                stage="stage2_static",
+                note="stage2 test",
+            )
+
+            # 1. --stage stage1_open evaluates with zero obstacles and no mismatch warning
+            stage_out = Path(tmpdir) / "stage1_report.json"
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                rc = eval_main(
+                    [
+                        "--checkpoint", str(stage1_ckpt),
+                        "--stage", "stage1_open",
+                        "--max-steps", "8",
+                        "--episodes", "1",
+                        "--seeds", "11",
+                        "--out", str(stage_out),
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            self.assertEqual([w for w in caught if "stage1_open" in str(w.message)], [])
+            stage_report = json.loads(stage_out.read_text())
+            self.assertEqual(stage_report["checkpoint_stage"], "stage1_open")
+            self.assertIn("stage1_open", stage_report["results"])
+            self.assertIn("L+S", stage_report["results"]["stage1_open"])
+            self.assertIn("L", stage_report["results"]["stage1_open"])
+
+            # 2. --modes open evaluates with zero obstacles and no mismatch warning
+            open_out = Path(tmpdir) / "open_report.json"
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                rc = eval_main(
+                    [
+                        "--checkpoint", str(stage1_ckpt),
+                        "--modes", "open",
+                        "--max-steps", "8",
+                        "--episodes", "1",
+                        "--seeds", "11",
+                        "--out", str(open_out),
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            self.assertEqual([w for w in caught if "stage1_open" in str(w.message)], [])
+            open_report = json.loads(open_out.read_text())
+            self.assertIn("open", open_report["results"])
+
+            # 3. stage1_open checkpoint evaluated in obstacle mode ('clean') emits warning
+            with self.assertWarnsRegex(UserWarning, "stage1_open"):
+                rc = eval_main(
+                    [
+                        "--checkpoint", str(stage1_ckpt),
+                        "--modes", "clean",
+                        "--max-steps", "6",
+                        "--episodes", "1",
+                        "--seeds", "11",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+
+            # 4. stage1_open checkpoint evaluated in obstacle stage ('stage2_static') emits warning
+            with self.assertWarnsRegex(UserWarning, "stage1_open"):
+                rc = eval_main(
+                    [
+                        "--checkpoint", str(stage1_ckpt),
+                        "--stage", "stage2_static",
+                        "--max-steps", "6",
+                        "--episodes", "1",
+                        "--seeds", "11",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+
+            # 5. stage2_static checkpoint evaluated in 'clean' does NOT emit stage1_open warning
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                rc = eval_main(
+                    [
+                        "--checkpoint", str(stage2_ckpt),
+                        "--modes", "clean",
+                        "--max-steps", "6",
+                        "--episodes", "1",
+                        "--seeds", "11",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            self.assertEqual([w for w in caught if "stage1_open" in str(w.message)], [])
 
 
 if __name__ == "__main__":

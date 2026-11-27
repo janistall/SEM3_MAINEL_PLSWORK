@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- Loopback-only Fast DDS 3.x / 2.x profile for MicroXRCEAgent + PX4 SITL.
+     Restricts DDS participant traffic strictly to 127.0.0.1 UDPv4 (no SHM,
+     no non-loopback NICs) so MicroXRCEAgent discovers ROS 2 Humble nodes
+     running with ROS_LOCALHOST_ONLY=1 on the configured ROS_DOMAIN_ID. -->
+<dds xmlns="http://www.eprosima.com">
+  <profiles>
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>udp_localhost</transport_id>
+        <type>UDPv4</type>
+        <interfaceWhiteList>
+          <address>127.0.0.1</address>
+        </interfaceWhiteList>
+      </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="px4_participant" is_default_profile="true">
+      <rtps>
+        <name>px4_micro_xrce_dds</name>
+        <useBuiltinTransports>false</useBuiltinTransports>
+        <userTransports>
+          <transport_id>udp_localhost</transport_id>
+        </userTransports>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>

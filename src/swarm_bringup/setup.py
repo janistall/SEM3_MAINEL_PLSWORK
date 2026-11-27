@@ -10,7 +10,7 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/launch", ["launch/swarm.launch.py"]),
-        ("share/" + package_name + "/config", ["config/scenario.json"]),
+        ("share/" + package_name + "/config", ["config/scenario.json", "config/fastdds_loopback.xml"]),
         ("share/" + package_name + "/worlds", ["worlds/swarm.sdf"]),
         (
             "share/" + package_name + "/checkpoints",

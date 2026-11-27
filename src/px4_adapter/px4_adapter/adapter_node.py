@@ -20,10 +20,22 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from std_srvs.srv import SetBool, Trigger
 from swarm_interfaces.msg import AgentTelemetry
 
+from .noise import inject_telemetry_noise
+from .rate import TelemetryRateLimiter
+
 
 def _px4_qos() -> QoSProfile:
     return QoSProfile(
         reliability=ReliabilityPolicy.BEST_EFFORT,
+        durability=DurabilityPolicy.VOLATILE,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+    )
+
+
+def _telemetry_qos() -> QoSProfile:
+    return QoSProfile(
+        reliability=ReliabilityPolicy.RELIABLE,
         durability=DurabilityPolicy.VOLATILE,
         history=HistoryPolicy.KEEP_LAST,
         depth=1,
@@ -42,10 +54,15 @@ class PX4AdapterNode(Node):
         self.declare_parameter("spawn_z", 0.1)
         self.declare_parameter("takeoff_altitude", 2.5)
         self.declare_parameter("takeoff_velocity", 0.8)
-        self.declare_parameter("auto_arm", True)
+        self.declare_parameter("auto_arm", False)
         self.declare_parameter("cmd_timeout", 0.5)
         self.declare_parameter("odom_timeout", 0.5)
         self.declare_parameter("status_timeout", 1.0)
+        self.declare_parameter("telemetry_rate", 10.0)
+        self.declare_parameter("telemetry_pos_noise_std", 0.0)
+        self.declare_parameter("telemetry_vel_noise_std", 0.0)
+        self.declare_parameter("telemetry_yaw_noise_std", 0.0)
+        self.declare_parameter("noise_seed", -1)
 
         self.drone_id = str(self.get_parameter("drone_id").value)
         namespace = str(self.get_parameter("px4_namespace").value).rstrip("/")
@@ -64,6 +81,23 @@ class PX4AdapterNode(Node):
         self.cmd_timeout = float(self.get_parameter("cmd_timeout").value)
         self.odom_timeout = float(self.get_parameter("odom_timeout").value)
         self.status_timeout = float(self.get_parameter("status_timeout").value)
+        self.telemetry_rate = float(self.get_parameter("telemetry_rate").value)
+        self._telemetry_limiter = TelemetryRateLimiter(self.telemetry_rate)
+        self.telemetry_pos_noise_std = max(
+            0.0, float(self.get_parameter("telemetry_pos_noise_std").value)
+        )
+        self.telemetry_vel_noise_std = max(
+            0.0, float(self.get_parameter("telemetry_vel_noise_std").value)
+        )
+        self.telemetry_yaw_noise_std = max(
+            0.0, float(self.get_parameter("telemetry_yaw_noise_std").value)
+        )
+        noise_seed = int(self.get_parameter("noise_seed").value)
+        self._noise_rng = (
+            np.random.default_rng(noise_seed + self.system_id)
+            if noise_seed >= 0
+            else np.random.default_rng()
+        )
 
         qos = _px4_qos()
         self.odom_sub = self.create_subscription(
@@ -73,7 +107,7 @@ class PX4AdapterNode(Node):
             qos,
         )
         self.status_subs = []
-        for topic in ("vehicle_status", "vehicle_status_v4"):
+        for topic in ("vehicle_status", "vehicle_status_v1", "vehicle_status_v4"):
             self.status_subs.append(
                 self.create_subscription(
                     VehicleStatus,
@@ -97,7 +131,7 @@ class PX4AdapterNode(Node):
         )
 
         self.telemetry_pub = self.create_publisher(
-            AgentTelemetry, f"/{self.drone_id}/telemetry", 10
+            AgentTelemetry, f"/{self.drone_id}/telemetry", _telemetry_qos()
         )
         self.traj_pub = self.create_publisher(
             TrajectorySetpoint, f"{self.namespace}/fmu/in/trajectory_setpoint", qos
@@ -108,6 +142,24 @@ class PX4AdapterNode(Node):
         self.command_pub = self.create_publisher(
             VehicleCommand, f"{self.namespace}/fmu/in/vehicle_command", qos
         )
+
+        self._telemetry_msg = AgentTelemetry()
+        self._telemetry_msg.header.frame_id = "world_enu"
+        self._telemetry_msg.drone_id = self.drone_id
+
+        self._offboard_msg = OffboardControlMode()
+        self._offboard_msg.position = False
+        self._offboard_msg.velocity = True
+        self._offboard_msg.acceleration = False
+        self._offboard_msg.attitude = False
+        self._offboard_msg.body_rate = False
+
+        self._traj_msg = TrajectorySetpoint()
+        self._traj_msg.position = [math.nan, math.nan, math.nan]
+        self._traj_msg.acceleration = [math.nan, math.nan, math.nan]
+        self._traj_msg.jerk = [math.nan, math.nan, math.nan]
+        self._traj_msg.yaw = math.nan
+        self._zero_vel = np.zeros(3, dtype=np.float64)
 
         self.arm_srv = self.create_service(SetBool, f"/{self.drone_id}/arm", self._on_arm)
         self.offboard_srv = self.create_service(
@@ -195,27 +247,17 @@ class PX4AdapterNode(Node):
         self._send_command(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, 1.0, 6.0)
 
     def _publish_offboard(self) -> None:
-        message = OffboardControlMode()
-        message.timestamp = self._now_us()
-        message.position = False
-        message.velocity = True
-        message.acceleration = False
-        message.attitude = False
-        message.body_rate = False
-        self.offboard_pub.publish(message)
+        self._offboard_msg.timestamp = self._now_us()
+        self.offboard_pub.publish(self._offboard_msg)
 
     def _publish_setpoint(self, velocity_enu: np.ndarray, yaw_rate_enu: float) -> None:
-        message = TrajectorySetpoint()
+        message = self._traj_msg
         message.timestamp = self._now_us()
-        message.position = [math.nan, math.nan, math.nan]
         message.velocity = [
             float(velocity_enu[1]),
             float(velocity_enu[0]),
             float(-velocity_enu[2]),
         ]
-        message.acceleration = [math.nan, math.nan, math.nan]
-        message.jerk = [math.nan, math.nan, math.nan]
-        message.yaw = math.nan
         message.yawspeed = float(-yaw_rate_enu)
         self.traj_pub.publish(message)
 
@@ -242,16 +284,22 @@ class PX4AdapterNode(Node):
         yaw_enu = (yaw_enu + math.pi) % (2.0 * math.pi) - math.pi
         return position, velocity, yaw_enu
 
-    def _publish_telemetry(self) -> None:
-        state = self._enu_state()
-        message = AgentTelemetry()
+    def _publish_telemetry(self, state=None, now: float | None = None) -> None:
+        if state is None:
+            state = self._enu_state()
+        now_f = time.monotonic() if now is None else float(now)
+        message = self._telemetry_msg
         message.header.stamp = self.get_clock().now().to_msg()
-        message.header.frame_id = "world_enu"
-        message.drone_id = self.drone_id
         if state is None:
             message.active_status = False
         else:
-            position, velocity, yaw = state
+            position, velocity, yaw = inject_telemetry_noise(
+                *state,
+                pos_std=self.telemetry_pos_noise_std,
+                vel_std=self.telemetry_vel_noise_std,
+                yaw_std=self.telemetry_yaw_noise_std,
+                rng=self._noise_rng,
+            )
             message.position.x = float(position[0])
             message.position.y = float(position[1])
             message.position.z = float(position[2])
@@ -259,7 +307,7 @@ class PX4AdapterNode(Node):
             message.velocity.y = float(velocity[1])
             message.velocity.z = float(velocity[2])
             message.yaw = float(yaw)
-            fresh = time.monotonic() - self.odom_time <= self.odom_timeout
+            fresh = now_f - self.odom_time <= self.odom_timeout
             message.active_status = bool(self.flying and fresh)
         self.telemetry_pub.publish(message)
 
@@ -286,25 +334,24 @@ class PX4AdapterNode(Node):
     def _tick(self) -> None:
         now = time.monotonic()
         self._publish_offboard()
-        self._publish_telemetry()
-
-        if self.odom is None:
-            return
         state = self._enu_state()
+        if self._telemetry_limiter.should_publish(now):
+            self._publish_telemetry(state, now)
+
         if state is None:
             return
         position, _, _ = state
 
         if self.phase == "WAIT":
-            if time.monotonic() - self.odom_time <= self.odom_timeout:
+            if now - self.odom_time <= self.odom_timeout:
                 self.phase = "STREAM"
                 self.phase_time = now
                 self.get_logger().info(f"{self.drone_id}: streaming offboard setpoints")
-            self._publish_setpoint(np.zeros(3), 0.0)
+            self._publish_setpoint(self._zero_vel, 0.0)
             return
 
         if self.phase == "STREAM":
-            self._publish_setpoint(np.zeros(3), 0.0)
+            self._publish_setpoint(self._zero_vel, 0.0)
             if now - self.phase_time >= 1.5:
                 if self.auto_arm:
                     self._send_arm(True)
@@ -314,7 +361,7 @@ class PX4AdapterNode(Node):
             return
 
         if self.phase == "ARM":
-            self._publish_setpoint(np.zeros(3), 0.0)
+            self._publish_setpoint(self._zero_vel, 0.0)
             if self._armed():
                 self._send_mode_offboard()
                 self.last_offboard_request = now
@@ -327,7 +374,7 @@ class PX4AdapterNode(Node):
             return
 
         if self.phase == "OFFBOARD":
-            self._publish_setpoint(np.zeros(3), 0.0)
+            self._publish_setpoint(self._zero_vel, 0.0)
             if self._offboard_active():
                 self.phase = "TAKEOFF"
                 self.phase_time = now
