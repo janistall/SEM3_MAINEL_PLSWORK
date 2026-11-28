@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>10-Drone Scripted Visualization Dashboard</title>
+<style>
+  :root {
+    --bg: #0b111c;
+    --panel: #131c2b;
+    --border: #24324a;
+    --text: #e6eefb;
+    --muted: #8ea3c4;
+    --green: #14eb73;
+    --orange: #ff571a;
+    --blue: #3b82f6;
+    --amber: #f59e0b;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 16px;
+    line-height: 1.4;
+  }
+  .banner {
+    background: linear-gradient(90deg, rgba(245,158,11,0.18), rgba(59,130,246,0.15));
+    border: 1px solid rgba(245,158,11,0.55);
+    border-radius: 10px;
+    padding: 12px 16px;
+    margin-bottom: 14px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .banner h1 { font-size: 16px; font-weight: 700; color: #fde68a; letter-spacing: 0.2px; }
+  .banner .sub { font-size: 12px; color: var(--muted); }
+  .pill {
+    font-size: 11px;
+    font-weight: 700;
+    padding: 4px 10px;
+    border-radius: 999px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    background: rgba(245,158,11,0.16);
+    color: #fcd34d;
+    border: 1px solid rgba(245,158,11,0.45);
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: minmax(340px, 1.15fr) minmax(360px, 1fr);
+    gap: 14px;
+  }
+  @media (max-width: 960px) { .grid { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px;
+  }
+  .card h2 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.7px;
+    color: var(--muted);
+    margin-bottom: 10px;
+  }
+  .progress-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 6px;
+    gap: 10px;
+  }
+  .act-name { font-size: 16px; font-weight: 700; color: #fff; }
+  .time-readout { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 14px; color: #93c5fd; }
+  .bar-bg {
+    width: 100%;
+    height: 10px;
+    background: #1d2a40;
+    border-radius: 6px;
+    overflow: hidden;
+    margin-bottom: 10px;
+  }
+  .bar-fill {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, #3b82f6, #14eb73);
+    transition: width 80ms linear;
+  }
+  .acts {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 6px;
+    margin-bottom: 12px;
+  }
+  .act-chip {
+    font-size: 10px;
+    text-align: center;
+    padding: 5px 4px;
+    border-radius: 6px;
+    background: #182336;
+    border: 1px solid #24324a;
+    color: var(--muted);
+  }
+  .act-chip.active {
+    background: rgba(59,130,246,0.22);
+    border-color: #60a5fa;
+    color: #fff;
+    font-weight: 700;
+  }
+  .act-chip.done {
+    background: rgba(20,235,115,0.12);
+    border-color: rgba(20,235,115,0.4);
+    color: #86efac;
+  }
+  .summary-strip {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  .stat-box {
+    background: #0f1726;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+  }
+  .stat-box .k { font-size: 11px; color: var(--muted); }
+  .stat-box .v { font-size: 18px; font-weight: 700; font-family: ui-monospace, monospace; margin-top: 2px; }
+  canvas {
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    background: #0c1320;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    display: block;
+  }
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-top: 8px;
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  th, td {
+    text-align: left;
+    padding: 7px 6px;
+    border-bottom: 1px solid #1d2a40;
+  }
+  th { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; }
+  .drone-id { display: inline-flex; align-items: center; gap: 7px; font-family: ui-monospace, monospace; font-weight: 700; }
+  .badge {
+    display: inline-block;
+    padding: 2px 7px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 700;
+  }
+  .badge-clear { background: rgba(20,235,115,0.16); color: var(--green); border: 1px solid rgba(20,235,115,0.45); }
+  .badge-alert { background: rgba(255,87,26,0.20); color: #ff8a5b; border: 1px solid rgba(255,87,26,0.60); }
+  .badge-arrived { background: rgba(20,235,115,0.22); color: #bbf7d0; border: 1px solid rgba(20,235,115,0.60); }
+  .badge-transit { background: rgba(59,130,246,0.18); color: #93c5fd; border: 1px solid rgba(59,130,246,0.45); }
+  .badge-staged { background: rgba(142,163,196,0.15); color: #cbd5e1; border: 1px solid rgba(142,163,196,0.35); }
+  .footer-note {
+    margin-top: 10px;
+    font-size: 11px;
+    color: var(--muted);
+  }
+</style>
+</head>
+<body>
+  <div class="banner">
+    <div>
+      <h1 id="label-title">Scripted illustration of proposed LiDAR and AI-assisted navigation.</h1>
+      <div class="sub">Prerecorded visual animation in Gazebo Harmonic — completely disconnected from PX4, ROS 2 flight control, MAVLink, DDS, live sensing, and policy inference.</div>
+    </div>
+    <div class="pill">Visual Animation Only</div>
+  </div>
+
+  <div class="card" style="margin-bottom: 14px;">
+    <div class="progress-row">
+      <div class="act-name" id="act-name">Waiting for Gazebo...</div>
+      <div class="time-readout" id="time-readout">0.0 s / 54.0 s (0%)</div>
+    </div>
+    <div class="bar-bg"><div class="bar-fill" id="bar-fill"></div></div>
+    <div class="acts" id="acts-row"></div>
+    <div class="summary-strip">
+      <div class="stat-box">
+        <div class="k">Illustrated Clear Space</div>
+        <div class="v" id="stat-clear" style="color: var(--green);">10 / 10</div>
+      </div>
+      <div class="stat-box">
+        <div class="k">Illustrated Obstacle Proximity</div>
+        <div class="v" id="stat-alert" style="color: var(--orange);">0 / 10</div>
+      </div>
+      <div class="stat-box">
+        <div class="k">Destination Markers Reached</div>
+        <div class="v" id="stat-arrived" style="color: #93c5fd;">0 / 10</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Top-Down Illustrated Arena View (Synced to Gazebo)</h2>
+      <canvas id="arena" width="560" height="560"></canvas>
+      <div class="legend">
+        <span><i class="dot" style="background:#0d59a6;"></i> START_ZONE</span>
+        <span><i class="dot" style="background:#0d8c4d;"></i> GOAL_ZONE &amp; Beacons</span>
+        <span><i class="dot" style="background:#14eb73;"></i> Clear-Space LiDAR Ring</span>
+        <span><i class="dot" style="background:#ff571a;"></i> Nearby-Obstacle Highlight</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>10-Drone Scripted Visualization Status</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Drone ID</th>
+            <th>Wing</th>
+            <th>Alt (m)</th>
+            <th>Illustrated Perception</th>
+            <th>Destination</th>
+          </tr>
+        </thead>
+        <tbody id="drone-tbody"></tbody>
+      </table>
+      <div class="footer-note">
+        Notice: Perception highlights and trajectories are prerecorded visual illustrations only. No live sensor data or AI performance metrics are produced.
+      </div>
+    </div>
+  </div>
+
+<script>
+const canvas = document.getElementById("arena");
+const ctx = canvas.getContext("2d");
+let meta = null;
+
+function worldToCanvas(x, y) {
+  const pad = 24;
+  const span = canvas.width - 2 * pad;
+  const cx = pad + ((x + 15) / 30) * span;
+  const cy = canvas.height - pad - ((y + 15) / 30) * span;
+  return [cx, cy];
+}
+
+function rgbCss(c, a = 1.0) {
+  return `rgba(${Math.round(c[0]*255)}, ${Math.round(c[1]*255)}, ${Math.round(c[2]*255)}, ${a})`;
+}
+
+function drawArena(state) {
+  if (!meta) return;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // Subtle +/- 15 m grid
+  ctx.strokeStyle = "rgba(148,163,184,0.12)";
+  ctx.lineWidth = 1;
+  for (let g = -15; g <= 15; g += 3) {
+    let [x0, y0] = worldToCanvas(g, -15);
+    let [x1, y1] = worldToCanvas(g, 15);
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+    [x0, y0] = worldToCanvas(-15, g);
+    [x1, y1] = worldToCanvas(15, g);
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+  }
+
+  const scale = (canvas.width - 48) / 30;
+  // START_ZONE and GOAL_ZONE discs
+  const sCx = meta.starts.reduce((a, p) => a + p[0], 0) / meta.starts.length;
+  const sCy = meta.starts.reduce((a, p) => a + p[1], 0) / meta.starts.length;
+  const gCx = meta.goals.reduce((a, p) => a + p[0], 0) / meta.goals.length;
+  const gCy = meta.goals.reduce((a, p) => a + p[1], 0) / meta.goals.length;
+
+  let [sx, sy] = worldToCanvas(sCx, sCy);
+  ctx.fillStyle = "rgba(13,89,166,0.22)";
+  ctx.strokeStyle = "rgba(59,130,246,0.65)";
+  ctx.beginPath(); ctx.arc(sx, sy, 4.0 * scale, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+
+  let [gx, gy] = worldToCanvas(gCx, gCy);
+  ctx.fillStyle = "rgba(13,140,77,0.22)";
+  ctx.strokeStyle = "rgba(20,235,115,0.65)";
+  ctx.beginPath(); ctx.arc(gx, gy, 4.0 * scale, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+
+  // Obstacles + active orange/red glow highlights
+  const activeGlows = new Set(state.glows || []);
+  for (const obs of meta.obstacles) {
+    const [ox, oy] = worldToCanvas(obs.x, obs.y);
+    const rad = obs.radius_eq * scale;
+    const glowing = activeGlows.has(obs.id);
+    if (glowing) {
+      ctx.fillStyle = "rgba(255,87,26,0.28)";
+      ctx.strokeStyle = "#ff571a";
+      ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.arc(ox, oy, rad + 6, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    }
+    ctx.fillStyle = obs.id.startsWith("showcase_") ? "#475569" : "#9a3412";
+    ctx.strokeStyle = glowing ? "#ff8a5b" : "#cbd5e1";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(ox, oy, Math.max(5, rad), 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  }
+
+  // Destination markers
+  meta.goals.forEach((g, idx) => {
+    const [bx, by] = worldToCanvas(g[0], g[1]);
+    ctx.strokeStyle = rgbCss(meta.colors_rgb[idx], 0.9);
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(bx, by, 5, 0, Math.PI * 2); ctx.stroke();
+  });
+
+  // Movement trails dropped so far
+  const trails = state.dropped_trails || [];
+  for (const pt of trails) {
+    const [tx, ty] = worldToCanvas(pt.x, pt.y);
+    ctx.fillStyle = rgbCss(meta.colors_rgb[pt.drone_idx], 0.72);
+    ctx.beginPath(); ctx.arc(tx, ty, 2.8, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // Drones + animated LiDAR rings/rays
+  const spin = state.t * 2.8;
+  (state.drones || []).forEach((d, idx) => {
+    const [dx, dy] = worldToCanvas(d.x, d.y);
+    const isAlert = d.alert;
+    const ringColor = isAlert ? "#ff571a" : "#14eb73";
+    const ringR = (isAlert ? 0.75 : 0.62) * scale;
+
+    if (d.z > 0.35) {
+      ctx.strokeStyle = ringColor;
+      ctx.lineWidth = isAlert ? 2.0 : 1.4;
+      ctx.beginPath(); ctx.arc(dx, dy, ringR, 0, Math.PI * 2); ctx.stroke();
+      for (let r = 0; r < 6; r++) {
+        const a = spin + idx * 0.5 + (r * Math.PI) / 3;
+        ctx.beginPath();
+        ctx.moveTo(dx, dy);
+        ctx.lineTo(dx + Math.cos(a) * ringR * 1.35, dy - Math.sin(a) * ringR * 1.35);
+        ctx.stroke();
+      }
+    }
+
+    ctx.fillStyle = rgbCss(meta.colors_rgb[idx], 1.0);
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(dx, dy, 5.2, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  });
+}
+
+function updateUI(state) {
+  document.getElementById("label-title").textContent = state.label;
+  document.getElementById("act-name").textContent = state.act_name;
+  const pct = Math.min(100, Math.max(0, state.progress_pct));
+  document.getElementById("time-readout").textContent =
+    `${state.t.toFixed(1)} s / ${state.duration.toFixed(1)} s (${pct.toFixed(0)}%)`;
+  document.getElementById("bar-fill").style.width = `${pct}%`;
+
+  const actsRow = document.getElementById("acts-row");
+  if (meta && actsRow.children.length === 0) {
+    meta.acts.forEach((a, i) => {
+      const el = document.createElement("div");
+      el.className = "act-chip";
+      el.id = `act-chip-${i}`;
+      el.textContent = `${i + 1}. ${a.name.split("(")[0].trim()}`;
+      actsRow.appendChild(el);
+    });
+  }
+  if (meta) {
+    meta.acts.forEach((a, i) => {
+      const el = document.getElementById(`act-chip-${i}`);
+      if (!el) return;
+      el.className = "act-chip";
+      if (state.t >= a.end && i < meta.acts.length - 1) el.classList.add("done");
+      else if (state.t >= a.start && state.t <= a.end) el.classList.add("active");
+    });
+  }
+
+  let clearCount = 0, alertCount = 0, arrivedCount = 0;
+  const tbody = document.getElementById("drone-tbody");
+  tbody.innerHTML = "";
+  (state.drones || []).forEach((d, idx) => {
+    if (d.alert) alertCount++; else clearCount++;
+    if (d.arrived) arrivedCount++;
+    const color = meta ? rgbCss(meta.colors_rgb[idx]) : "#38bdf8";
+    const percBadge = d.alert
+      ? `<span class="badge badge-alert">NEAR: ${d.nearest}</span>`
+      : `<span class="badge badge-clear">CLEAR SPACE</span>`;
+    let destBadge = `<span class="badge badge-staged">STAGED</span>`;
+    if (d.arrived) destBadge = `<span class="badge badge-arrived">ARRIVED</span>`;
+    else if (d.z > 0.35) destBadge = `<span class="badge badge-transit">${state.short_stage}</span>`;
+
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><span class="drone-id"><i class="dot" style="background:${color};"></i>${d.id}</span></td>
+      <td>${d.wing}</td>
+      <td style="font-family:monospace;">${d.z.toFixed(2)}</td>
+      <td>${percBadge}</td>
+      <td>${destBadge}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  document.getElementById("stat-clear").textContent = `${clearCount} / 10`;
+  document.getElementById("stat-alert").textContent = `${alertCount} / 10`;
+  document.getElementById("stat-arrived").textContent = `${arrivedCount} / 10`;
+  drawArena(state);
+}
+
+async function poll() {
+  try {
+    if (!meta) {
+      const r0 = await fetch("/api/meta");
+      if (r0.ok) meta = await r0.json();
+    }
+    const r = await fetch("/api/state");
+    if (r.ok) updateUI(await r.json());
+  } catch (_) {}
+  setTimeout(poll, 120);
+}
+poll();
+</script>
+</body>
+</html>
